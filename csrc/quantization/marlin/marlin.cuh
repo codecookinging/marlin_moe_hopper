@@ -2,10 +2,14 @@
 
 #ifndef _marlin_cuh
   #define _marlin_cuh
-  #include <torch/all.h>
-
-  #include <ATen/cuda/CUDAContext.h>
-  #include <c10/cuda/CUDAGuard.h>
+  // These torch headers are only needed by non-stable callers (e.g. ops.cu).
+  // Guard them so that stable ABI targets can still include marlin.cuh
+  // for Vec, constants, and cp_async helpers without pulling in torch/all.h.
+  #ifndef TORCH_TARGET_VERSION
+    #include <torch/all.h>
+    #include <ATen/cuda/CUDAContext.h>
+    #include <c10/cuda/CUDAGuard.h>
+  #endif
   #include <cuda.h>
   #include <cuda_fp16.h>
   #include <cuda_runtime.h>
@@ -53,6 +57,8 @@ using I4 = Vec<int, 4>;
 
 constexpr int div_ceil(int a, int b) { return (a + b - 1) / b; }
 
+  #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+
 __device__ inline void cp_async1_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
@@ -69,48 +75,106 @@ __device__ inline void cp_async2_ca_pred(void* smem_ptr, const void* glob_ptr,
   }
 }
 
-__device__ __forceinline__ void load_global_cg_u32x4(
-    const void* glob_ptr, uint32_t& r0, uint32_t& r1, uint32_t& r2,
-    uint32_t& r3) {
-  asm volatile("ld.global.cg.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-               : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-               : "l"(glob_ptr));
-}
-
-__device__ __forceinline__ void store_u32x4(void* smem_ptr, uint32_t r0,
-                                            uint32_t r1, uint32_t r2,
-                                            uint32_t r3) {
-  reinterpret_cast<uint4*>(smem_ptr)[0] = make_uint4(r0, r1, r2, r3);
-}
-
 __device__ inline void cp_async4_ca_pred(void* smem_ptr, const void* glob_ptr,
                                          bool pred = true) {
   if (pred) {
-    uint32_t r0, r1, r2, r3;
-    load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
-    store_u32x4(smem_ptr, r0, r1, r2, r3);
+    reinterpret_cast<int4*>(smem_ptr)[0] =
+        reinterpret_cast<const int4*>(glob_ptr)[0];
   }
 }
 
 __device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr,
                                       bool pred = true) {
   if (pred) {
-    uint32_t r0, r1, r2, r3;
-    load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
-    store_u32x4(smem_ptr, r0, r1, r2, r3);
+    reinterpret_cast<int4*>(smem_ptr)[0] =
+        reinterpret_cast<const int4*>(glob_ptr)[0];
   }
 }
 
 __device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
-  uint32_t r0, r1, r2, r3;
-  load_global_cg_u32x4(glob_ptr, r0, r1, r2, r3);
-  store_u32x4(smem_ptr, r0, r1, r2, r3);
+  reinterpret_cast<int4*>(smem_ptr)[0] =
+      reinterpret_cast<const int4*>(glob_ptr)[0];
 }
 
 __device__ inline void cp_async_fence() {}
 
 template <int n>
 __device__ inline void cp_async_wait() {}
+
+  #else
+
+__device__ inline void cp_async1_ca_pred(void* smem_ptr, const void* glob_ptr,
+                                         bool pred = true) {
+  const int BYTES = 4;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async2_ca_pred(void* smem_ptr, const void* glob_ptr,
+                                         bool pred = true) {
+  const int BYTES = 8;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async4_ca_pred(void* smem_ptr, const void* glob_ptr,
+                                         bool pred = true) {
+  const int BYTES = 16;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.ca.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async4_pred(void* smem_ptr, const void* glob_ptr,
+                                      bool pred = true) {
+  const int BYTES = 16;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   .reg .pred p;\n"
+      "   setp.ne.b32 p, %0, 0;\n"
+      "   @p cp.async.cg.shared.global [%1], [%2], %3;\n"
+      "}\n" ::"r"((int)pred),
+      "r"(smem), "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async4(void* smem_ptr, const void* glob_ptr) {
+  const int BYTES = 16;
+  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "{\n"
+      "   cp.async.cg.shared.global [%0], [%1], %2;\n"
+      "}\n" ::"r"(smem),
+      "l"(glob_ptr), "n"(BYTES));
+}
+
+__device__ inline void cp_async_fence() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template <int n>
+__device__ inline void cp_async_wait() {
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
+}
+
+  #endif
 
 }  // namespace MARLIN_NAMESPACE_NAME
 

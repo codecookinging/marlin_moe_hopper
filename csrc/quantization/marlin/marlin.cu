@@ -37,7 +37,7 @@ __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 
 __global__ void permute_cols_kernel(int4 const* __restrict__ a_int4_ptr,
                                     int const* __restrict__ perm_int_ptr,
@@ -57,7 +57,7 @@ torch::Tensor marlin_gemm(
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float) {
   TORCH_CHECK_NOT_IMPLEMENTED(false,
-                              "marlin_gemm(..) requires an SM70 build.");
+                              "marlin_gemm(..) requires CUDA_ARCH >= 7.5");
   return torch::empty({1, 1});
 }
 
@@ -356,7 +356,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* bias_ptr = (const int4*)b_bias;
   const float* a_s_ptr = (const float*)a_s;
   const int4* b_s_ptr = (const int4*)b_s;
-  const uint16_t* g_s_ptr = (const uint16_t*)g_s;
+  const float* g_s_ptr = (const float*)g_s;
 
   const int4* zp_ptr = (const int4*)zp;
   const int* g_idx_ptr = (const int*)g_idx;
@@ -391,9 +391,23 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability == 7 && minor_capability == 0,
-              "marlin SM70 build only supports SM70 GPUs.");
-  int stages = 2;
+  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
+              "marlin kernel only support Turing or newer GPUs.");
+  int stages = 4;
+  if (major_capability == 7 && minor_capability == 5) {
+    stages = 2;
+    TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
+                "Turing only support FP16 or INT8 activation.");
+  }
+  if (a_type == vllm::kFE4M3fn) {
+    TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
+                "FP8 only support Ada Lovelace or newer GPUs.");
+    TORCH_CHECK(
+        major_capability * 10 + minor_capability == 89 ||
+            major_capability == 12,
+        "Marlin W4A8-FP8 only support SM89 or SM12x device (It is slower than "
+        "Marlin W4A16 on other devices).");
+  }
 
   int max_par = 16;
   if (prob_n <= 4096) max_par = 16 * 8;
@@ -579,23 +593,15 @@ torch::Tensor marlin_gemm(
                   "When b_type = float4_e2m1f, b_scale scalar type must be",
                   "float8_e4m3fn (for NVFP4) or float8_e8m0fnu (for MXFP4).");
     }
+  } else if (b_type_id == vllm::kFE4M3fn.id() &&
+             b_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
+    s_type_id = vllm::kFE8M0fnu.id();
   }
 
   vllm::ScalarType a_type = vllm::ScalarType::from_id(a_type_id);
   vllm::ScalarType b_type = vllm::ScalarType::from_id(b_type_id);
   vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
-
-  TORCH_CHECK(a_type == vllm::kFloat16,
-              "SM70 build only supports float16 activations.");
-  TORCH_CHECK(c_type == vllm::kFloat16,
-              "SM70 build only supports float16 outputs.");
-  TORCH_CHECK(s_type == vllm::kFloat16,
-              "SM70 build only supports float16 scales.");
-  TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
-                  b_type == vllm::kU8B128,
-              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
-  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
 
@@ -747,9 +753,12 @@ torch::Tensor marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(false, "SM70 build does not support nvfp4 global_scale.");
+    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+                "global_scale can only be used for nvfp4 format.");
   } else {
-    global_scale = torch::empty({0}, options);
+    global_scale = torch::empty({0}, options_fp32);
+    TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
+                "the global_scale parameter must be passed for nvfp4 format.");
   }
 
   bool has_bias = b_bias_or_none.has_value();
@@ -774,13 +783,22 @@ torch::Tensor marlin_gemm(
   }
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
-    TORCH_CHECK(b_type == vllm::kU4,
-                "SM70 build only supports uint4 weights when zero-points are enabled. Got = ",
-                b_type.str());
+    TORCH_CHECK(
+        b_type == vllm::kU4 || b_type == vllm::kU8,
+        "b_type must be u4 or u8 when has_zp = True. Got = ", b_type.str());
   } else {
-    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
+    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128 ||
+                    b_type == vllm::kS4 || b_type == vllm::kS8 ||
+                    b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
+                "b_type must be uint4b8, uint8b128, int4, int8, "
+                "float8_e4m3fn or float4_e2m1f when has_zp = False. Got = ",
                 b_type.str());
+  }
+
+  if (has_zp && is_zp_float) {
+    TORCH_CHECK(a.scalar_type() == at::ScalarType::Half,
+                "Computation type must be float16 (half) when using float zero "
+                "points.");
   }
 
   // Verify b_zeros
@@ -819,8 +837,8 @@ torch::Tensor marlin_gemm(
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
-  TORCH_CHECK(global_scale.scalar_type() == c.scalar_type(),
-              "scalar type of global_scale must be the same with c");
+  TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
+              "scalar type of global_scale must be float");
   if (a_type.size_bits() == 16) {
     TORCH_CHECK(
         a.scalar_type() == c.scalar_type(),
