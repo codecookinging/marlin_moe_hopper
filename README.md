@@ -64,13 +64,13 @@ uv pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
 构建前推荐设置 CUDA 相关环境变量：
 
 ```bash
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH="$PWD/.venv/bin:/usr/local/cuda-12.8/bin:$PATH"
-export LD_LIBRARY_PATH="/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
-export MAX_JOBS=8
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH="$PWD/.venv/bin:/usr/local/cuda-13.0/bin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/cuda-13.0/lib64:${LD_LIBRARY_PATH:-}"
+export MAX_JOBS=60
 export NVCC_THREADS=1
-export TORCH_CUDA_ARCH_LIST='7.0'
-export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_70,code=sm_70'
+export TORCH_CUDA_ARCH_LIST='9.0'
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_90,code=sm_90'
 ```
 
 注意：动态库环境变量应使用 `LD_LIBRARY_PATH`。如果你手头的命令里写的是 `D_LIBRARY_PATH`，请改成 `LD_LIBRARY_PATH`。

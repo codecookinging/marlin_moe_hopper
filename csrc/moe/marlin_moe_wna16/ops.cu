@@ -31,6 +31,20 @@
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
 
+static bool effective_use_atomic_add_host(int dev, bool is_a_8bit,
+                                          bool use_fp32_reduce,
+                                          bool use_atomic_add) {
+#if MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
+  if (!is_a_8bit && !use_fp32_reduce) {
+    int major_capability = 0;
+    cudaDeviceGetAttribute(&major_capability,
+                           cudaDevAttrComputeCapabilityMajor, dev);
+    if (major_capability >= 9) return true;
+  }
+#endif
+  return use_atomic_add;
+}
+
 namespace MARLIN_NAMESPACE_NAME {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
@@ -269,7 +283,7 @@ exec_config_t determine_exec_config(
     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
     bool m_block_size_8, int num_bits, int group_size, bool has_act_order,
     bool is_k_full, bool has_zp, bool is_zp_float, bool is_a_8bit, int stages,
-    int max_shared_mem, int sms) {
+    int max_shared_mem, int sms, bool is_sm90) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -314,10 +328,20 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    if (thread_m_blocks == 1)
-      allow_count = max(min(allow_count, 4), 1);
-    else
-      allow_count = max(min(allow_count, 2), 1);
+    int max_blocks_per_sm = 1;
+    if (is_sm90) {
+      if (thread_m_blocks == 1) {
+        max_blocks_per_sm = th_config.num_threads >= 256 ? 6 : 5;
+      } else {
+        max_blocks_per_sm = 3;
+      }
+    } else {
+      if (thread_m_blocks == 1)
+        max_blocks_per_sm = 4;
+      else
+        max_blocks_per_sm = 2;
+    }
+    allow_count = max(min(allow_count, max_blocks_per_sm), 1);
 
     if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
       allow_count =
@@ -382,7 +406,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* bias_ptr = (const int4*)b_bias;
   const float* a_s_ptr = (const float*)a_s;
   const int4* b_s_ptr = (const int4*)b_s;
-  const uint16_t* g_s_ptr = (const uint16_t*)g_s;
+  const float* g_s_ptr = (const float*)g_s;
   const int4* zp_ptr = (const int4*)zp;
   const int* g_idx_ptr = (const int*)g_idx;
   const int* perm_ptr = (const int*)perm;
@@ -435,9 +459,31 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
                          dev);
-  TORCH_CHECK(major_capability == 7 && minor_capability == 0,
-              "marlin moe SM70 build only supports SM70 GPUs.");
-  int stages = 2;
+  TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
+              "marlin kernel only support Turing or newer GPUs.");
+  // Default pipeline depth: 2 on Turing, 4 on Ampere/Ada, 5 on Hopper.
+  // SM90 (H100) has ~228 KB opt-in shared memory vs ~164 KB on SM80, which
+  // fits one extra pipeline stage and hides more global-memory latency.
+  // The autotuning below will fall back to stages=4 if a stages=5 config is
+  // not found (e.g. because the combination of thread_n / thread_k is such
+  // that 5 stages still exceeds the smem budget for that tile).
+  int stages = 4;
+  if (major_capability == 7 && minor_capability == 5) {
+    stages = 2;
+    TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
+                "Turing only support FP16 or INT8 activation.");
+  } else if (major_capability >= 9) {
+    stages = 5;
+  }
+  if (a_type == vllm::kFE4M3fn) {
+    TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
+                "FP8 only support Ada Lovelace or newer GPUs.");
+    TORCH_CHECK(
+        major_capability * 10 + minor_capability == 89 ||
+            major_capability == 12,
+        "Marlin W4A8-FP8 only support SM89 or SM12x device (It is slower than "
+        "Marlin W4A16 on other devices).");
+  }
 
   // Set thread config
   exec_config_t exec_cfg;
@@ -452,11 +498,22 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                 " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
+    bool is_sm90 = major_capability >= 9;
     exec_cfg = determine_exec_config(
         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
         has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
-        max_shared_mem, sms);
+        max_shared_mem, sms, is_sm90);
+    // On SM90+ we prefer stages=5 but fall back to stages=4 when the chosen
+    // tile configuration does not fit in shared memory at depth 5.
+    if (is_sm90 && stages == 5 && exec_cfg.tb_cfg.thread_k == -1) {
+      stages = 4;
+      exec_cfg = determine_exec_config(
+          a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
+          top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
+          has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
+          max_shared_mem, sms, is_sm90);
+    }
     thread_tfg = exec_cfg.tb_cfg;
   }
 
@@ -483,6 +540,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
               ", has_act_order = ", has_act_order, ", is_k_full = ", is_k_full,
               ", has_zp = ", has_zp, ", is_zp_float = ", is_zp_float,
               ", max_shared_mem = ", max_shared_mem);
+
+  use_atomic_add =
+      effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
   int sh_cache_size =
       get_kernel_cache_size(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
@@ -585,23 +645,15 @@ torch::Tensor moe_wna16_marlin_gemm(
                   "When b_type = float4_e2m1f, b_scale scalar type must be",
                   "float8_e4m3fn (for NVFP4) or float8_e8m0fnu (for MXFP4).");
     }
+  } else if (b_type_id == vllm::kFE4M3fn.id() &&
+             b_scales.scalar_type() == at::ScalarType::Float8_e8m0fnu) {
+    s_type_id = vllm::kFE8M0fnu.id();
   }
 
   vllm::ScalarType a_type = vllm::ScalarType::from_id(a_type_id);
   vllm::ScalarType b_type = vllm::ScalarType::from_id(b_type_id);
   vllm::ScalarType c_type = vllm::ScalarType::from_id(c_type_id);
   vllm::ScalarType s_type = vllm::ScalarType::from_id(s_type_id);
-
-  TORCH_CHECK(a_type == vllm::kFloat16,
-              "SM70 build only supports float16 activations.");
-  TORCH_CHECK(c_type == vllm::kFloat16,
-              "SM70 build only supports float16 outputs.");
-  TORCH_CHECK(s_type == vllm::kFloat16,
-              "SM70 build only supports float16 scales.");
-  TORCH_CHECK(b_type == vllm::kU4 || b_type == vllm::kU4B8 ||
-                  b_type == vllm::kU8B128,
-              "SM70 build only supports uint4, uint4b8, or uint8b128 weights.");
-  TORCH_CHECK(!is_zp_float, "SM70 build does not support float zero-points.");
 
   int pack_factor = 32 / b_type.size_bits();
   int num_experts = b_q_weight.size(0);
@@ -681,6 +733,10 @@ torch::Tensor moe_wna16_marlin_gemm(
     c = torch::empty({size_m * top_k, size_n}, options);
   }
 
+  int dev = a.get_device();
+  use_atomic_add = effective_use_atomic_add_host(
+      dev, a_type.size_bits() == 8, use_fp32_reduce, use_atomic_add);
+
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
@@ -753,9 +809,12 @@ torch::Tensor moe_wna16_marlin_gemm(
   torch::Tensor global_scale;
   if (global_scale_or_none.has_value()) {
     global_scale = global_scale_or_none.value();
-    TORCH_CHECK(false, "SM70 build does not support nvfp4 global_scale.");
+    TORCH_CHECK(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn,
+                "global_scale can only be used for nvfp4 format.");
   } else {
-    global_scale = torch::empty({0}, options);
+    global_scale = torch::empty({0}, options_fp32);
+    TORCH_CHECK(!(b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn),
+                "the global_scale parameter must be passed for nvfp4 format.");
   }
 
   bool has_bias = b_bias_or_none.has_value();
@@ -781,13 +840,21 @@ torch::Tensor moe_wna16_marlin_gemm(
   bool has_zp = b_zeros.size(-1) > 0;
   if (has_zp) {
     TORCH_CHECK(
-        false,
-        "SM70 MoE build currently does not enable uint4 zero-point kernels; "
-        "use uint4b8 or uint8b128 weights on the GPU Marlin path.");
+        b_type == vllm::kU4 || b_type == vllm::kU8,
+        "b_type must be u4 or u8 when has_zp = True. Got = ", b_type.str());
   } else {
-    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128,
-                "SM70 build only supports uint4b8 or uint8b128 weights without zero-points. Got = ",
+    TORCH_CHECK(b_type == vllm::kU4B8 || b_type == vllm::kU8B128 ||
+                    b_type == vllm::kS4 || b_type == vllm::kS8 ||
+                    b_type == vllm::kFE4M3fn || b_type == vllm::kFE2M1f,
+                "b_type must be uint4b8, uint8b128, int4, int8, "
+                "float8_e4m3fn or float4_e2m1f when has_zp = False. Got = ",
                 b_type.str());
+  }
+
+  if (has_zp && is_zp_float) {
+    TORCH_CHECK(a.scalar_type() == at::ScalarType::Half,
+                "Computation type must be float16 (half) when using float zero "
+                "points.");
   }
 
   // Verify b_zeros
@@ -824,21 +891,15 @@ torch::Tensor moe_wna16_marlin_gemm(
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
 
-  int dev = a.get_device();
-
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
-  TORCH_CHECK(global_scale.scalar_type() == c.scalar_type(),
-              "scalar type of global_scale must be the same with c");
+  TORCH_CHECK(global_scale.scalar_type() == at::ScalarType::Float,
+              "scalar type of global_scale must be float");
   if (a_type.size_bits() == 16) {
     TORCH_CHECK(
         a.scalar_type() == c.scalar_type(),
         "scalar type of a must be the same with c for 16 bit activation");
   }
-
-  // SM70 MoE execution must stay on the real GPU Marlin kernel path.
-  // The removed CUTLASS MoE fallback was a host-orchestrated helper, not a
-  // true GPU MoE kernel implementation.
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),

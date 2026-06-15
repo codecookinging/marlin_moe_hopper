@@ -64,7 +64,7 @@ function(marlin_configure_cuda_sources)
 endfunction()
 
 set(CUDA_ARCHS "7.0")
-set(VLLM_GPU_ARCHES "70")
+set(VLLM_GPU_ARCHES "90")
 set(CUDA_ARCHS_STR "7.0")
 message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS}")
 message(STATUS "marlin_v100 CMake CUDA architectures: ${VLLM_GPU_ARCHES}")
@@ -96,12 +96,12 @@ marlin_generate_kernels(
   marlin_generation.log
   "marlin_v100 dense kernel generation failed")
 
-file(GLOB MARLIN_TEMPLATE_SM70_KERNEL_SRC "csrc/quantization/marlin/sm70_kernel_*.cu")
+file(GLOB MARLIN_TEMPLATE_SM90_KERNEL_SRC "csrc/quantization/marlin/sm90_kernel_*.cu")
 marlin_configure_cuda_sources(
-  SRCS "${MARLIN_TEMPLATE_SM70_KERNEL_SRC}"
+  SRCS "${MARLIN_TEMPLATE_SM90_KERNEL_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}"
   WITH_STATIC_TEMPLATE_STUB_WORKAROUND)
-list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM70_KERNEL_SRC})
+list(APPEND MARLIN_V100_DENSE_SRC ${MARLIN_TEMPLATE_SM90_KERNEL_SRC})
 
 set(MARLIN_SRCS
    "csrc/quantization/marlin/marlin.cu"
@@ -130,12 +130,12 @@ marlin_generate_kernels(
   moe_marlin_generation.log
   "marlin_v100 moe kernel generation failed")
 
-file(GLOB MARLIN_MOE_SM70_SRC "csrc/moe/marlin_moe_wna16/sm70_kernel_*.cu")
+file(GLOB MARLIN_MOE_SM90_SRC "csrc/moe/marlin_moe_wna16/sm90_kernel_*.cu")
 marlin_configure_cuda_sources(
-  SRCS "${MARLIN_MOE_SM70_SRC}"
+  SRCS "${MARLIN_MOE_SM90_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}"
   WITH_STATIC_TEMPLATE_STUB_WORKAROUND)
-list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM70_SRC})
+list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_SM90_SRC})
 
 set(MARLIN_MOE_OTHER_SRC "csrc/moe/marlin_moe_wna16/ops.cu")
 marlin_configure_cuda_sources(
