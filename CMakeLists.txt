@@ -63,9 +63,9 @@ function(marlin_configure_cuda_sources)
   endif()
 endfunction()
 
-set(CUDA_ARCHS "7.0")
+set(CUDA_ARCHS "9.0")
 set(VLLM_GPU_ARCHES "90")
-set(CUDA_ARCHS_STR "7.0")
+set(CUDA_ARCHS_STR "9.0")
 message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS}")
 message(STATUS "marlin_v100 CMake CUDA architectures: ${VLLM_GPU_ARCHES}")
 
