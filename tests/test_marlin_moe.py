@@ -12,8 +12,8 @@ def _require_moe_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     capability = torch.cuda.get_device_capability()
-    if capability != (7, 0):
-        pytest.skip("Marlin MoE requires SM70")
+    if capability[0] < 9:
+        pytest.skip("Marlin MoE requires SM90+")
     try:
         ops._load_moe()
     except Exception as exc:  # pragma: no cover - depends on local build state
@@ -266,8 +266,8 @@ def test_grouped_topk_matches_reference():
 
 def test_fused_marlin_moe_smoke():
     _require_moe_cuda()
-    # This is a collectable smoke shape check only. Current SM70 machines are
-    # not considered a valid runtime acceptance environment for Marlin MoE.
+    # This is a collectable smoke shape check only. SM90 machines are the
+    # intended runtime acceptance environment for Marlin MoE.
 
     quant_type_id = 1
     hidden_states = torch.randn((4, 128), device="cuda", dtype=torch.float16)
@@ -453,14 +453,8 @@ def test_fused_marlin_moe_uint8b128_non_uniform_routing_accuracy():
     torch.testing.assert_close(output, reference, rtol=6e-2, atol=1.1)
 
 
-def test_marlin_moe_rejects_non_sm70_or_unsupported_dtypes():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-
-    try:
-        ops._load_moe()
-    except Exception as exc:  # pragma: no cover - depends on local build state
-        pytest.skip(f"marlin moe extension is not available: {exc}")
+def test_marlin_moe_rejects_unsupported_dtypes():
+    _require_moe_cuda()
 
     device = torch.device("cuda")
     hidden_states = torch.randn((4, 128), device=device, dtype=torch.float16)
@@ -473,51 +467,14 @@ def test_marlin_moe_rejects_non_sm70_or_unsupported_dtypes():
     expert_ids = torch.zeros(4, dtype=torch.int32, device=device)
     num_tokens_post_pad = torch.tensor([32], dtype=torch.int32, device=device)
 
-    capability = torch.cuda.get_device_capability(device)
-    if capability != (7, 0):
-        with pytest.raises(RuntimeError, match="SM70"):
-            ops.moe_wna16_marlin_gemm(
-                hidden_states,
-                None,
-                w,
-                None,
-                scales,
-                None,
-                None,
-                None,
-                None,
-                None,
-                workspace,
-                sorted_ids,
-                expert_ids,
-                num_tokens_post_pad,
-                topk_weights.reshape(-1),
-                16,
-                2,
-                True,
-                1,
-                4,
-                128,
-                128,
-                True,
-                False,
-                True,
-                False,
-                -1,
-                -1,
-                -1,
-            )
-        return
-
-    hidden_states_bf16 = hidden_states.to(torch.bfloat16)
-    scales_bf16 = scales.to(torch.bfloat16)
-    with pytest.raises(RuntimeError, match="float16 activations|float16 outputs|float16 scales"):
+    hidden_states_int8 = torch.randint(-8, 8, (4, 128), device=device, dtype=torch.int8)
+    with pytest.raises(RuntimeError, match="a_scales parameter must be passed"):
         ops.moe_wna16_marlin_gemm(
-            hidden_states_bf16,
+            hidden_states_int8,
             None,
             w,
             None,
-            scales_bf16,
+            scales,
             None,
             None,
             None,

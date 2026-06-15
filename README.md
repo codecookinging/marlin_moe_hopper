@@ -103,7 +103,7 @@ PY
 
 ## 测试方法
 
-当前工作区已经在本地 `SM70` / V100 环境上验证过完整 pytest 回归。建议的验收步骤是：
+当前工作区已经在本地 `SM90` / H100 环境上验证过完整 pytest 回归。建议的验收步骤是：
 
 - `PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace`
 - `import marlin_v100`
@@ -115,14 +115,13 @@ PY
 
 ## 当前限制
 
-当前工作区已经固定为 `SM70` 单架构构建，并在当前 V100 / `SM70` 机器上完成过构建、导入和本地 pytest 回归。
+当前工作区已经固定为 `SM90` 单架构构建，并在 H100 / `SM90` 机器上完成构建、导入和本地 pytest 回归。
 
 这意味着：
 
 - 可以验证目录结构、构建脚本、扩展落位、导入与本地测试
-- 当前本地回归基线是 `19 passed, 1 skipped`
-- skip 项来自 `tests/test_marlin_moe.py` 中允许跳过的 smoke case，不代表构建或导入异常
-- 当前实现仍然是 `SM70` 专用路径，不应把它当作 `SM75+` 主树行为的直接替代
+- CUDA 运行时测试需要 `SM90+` GPU；非 SM90 机器上 GPU 相关用例会 skip
+- 当前实现面向 Hopper（`SM90`）路径，包含 5-stage pipeline 与 stages=4 fallback
 
 ## 与主树同步方式
 

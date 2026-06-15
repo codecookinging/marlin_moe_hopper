@@ -18,8 +18,8 @@ def _require_marlin_cuda() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     capability = torch.cuda.get_device_capability()
-    if capability != (7, 0):
-        pytest.skip("Marlin requires SM70")
+    if capability[0] < 9:
+        pytest.skip("Marlin requires SM90+")
     try:
         ops._load_dense()
     except Exception as exc:  # pragma: no cover - depends on local build state
@@ -182,14 +182,8 @@ def test_marlin_dense_uint8b128_accuracy():
     torch.testing.assert_close(output, reference, rtol=4e-2, atol=2e-1)
 
 
-def test_marlin_dense_rejects_non_sm70_or_unsupported_dtypes():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-
-    try:
-        ops._load_dense()
-    except Exception as exc:  # pragma: no cover - depends on local build state
-        pytest.skip(f"marlin dense extension is not available: {exc}")
+def test_marlin_dense_rejects_unsupported_dtypes():
+    _require_marlin_cuda()
 
     device = torch.device("cuda")
     a = torch.randn((16, 256), device=device, dtype=torch.float16)
@@ -199,42 +193,15 @@ def test_marlin_dense_rejects_non_sm70_or_unsupported_dtypes():
     )
     workspace = marlin_make_workspace_new(device)
 
-    capability = torch.cuda.get_device_capability(device)
-    if capability != (7, 0):
-        with pytest.raises(RuntimeError, match="SM70"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                None,
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                workspace,
-                scalar_types.uint4b8.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                True,
-                False,
-                True,
-                False,
-            )
-        return
-
     a_int8 = torch.randint(-8, 8, (16, 256), device=device, dtype=torch.int8)
-    a_scales = torch.ones((16,), device=device, dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="float16 activations"):
+    with pytest.raises(RuntimeError, match="a_scales parameter must be passed"):
         ops.marlin_gemm(
             a_int8,
             None,
             q_w,
             None,
             scales,
-            a_scales,
+            None,
             None,
             None,
             g_idx,
@@ -252,13 +219,7 @@ def test_marlin_dense_rejects_non_sm70_or_unsupported_dtypes():
 
 
 def test_marlin_dense_uint8b128_rejects_unsupported_dtypes():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-
-    try:
-        ops._load_dense()
-    except Exception as exc:  # pragma: no cover - depends on local build state
-        pytest.skip(f"marlin dense extension is not available: {exc}")
+    _require_marlin_cuda()
 
     device = torch.device("cuda")
     a = torch.randn((16, 256), device=device, dtype=torch.float16)
@@ -268,42 +229,15 @@ def test_marlin_dense_uint8b128_rejects_unsupported_dtypes():
     )
     workspace = marlin_make_workspace_new(device)
 
-    capability = torch.cuda.get_device_capability(device)
-    if capability != (7, 0):
-        with pytest.raises(RuntimeError, match="SM70"):
-            ops.marlin_gemm(
-                a,
-                None,
-                q_w,
-                None,
-                scales,
-                None,
-                None,
-                None,
-                g_idx,
-                sort_indices,
-                workspace,
-                scalar_types.uint8b128.id,
-                a.shape[0],
-                w.shape[1],
-                w.shape[0],
-                True,
-                False,
-                True,
-                False,
-            )
-        return
-
     a_int8 = torch.randint(-8, 8, (16, 256), device=device, dtype=torch.int8)
-    a_scales = torch.ones((16,), device=device, dtype=torch.float32)
-    with pytest.raises(RuntimeError, match="float16 activations"):
+    with pytest.raises(RuntimeError, match="a_scales parameter must be passed"):
         ops.marlin_gemm(
             a_int8,
             None,
             q_w,
             None,
             scales,
-            a_scales,
+            None,
             None,
             None,
             g_idx,
@@ -311,56 +245,6 @@ def test_marlin_dense_uint8b128_rejects_unsupported_dtypes():
             workspace,
             scalar_types.uint8b128.id,
             a_int8.shape[0],
-            w.shape[1],
-            w.shape[0],
-            True,
-            False,
-            True,
-            False,
-        )
-
-    a_bf16 = a.to(torch.bfloat16)
-    scales_bf16 = scales.to(torch.bfloat16)
-    with pytest.raises(RuntimeError, match="float16 outputs|float16 scales|float16 activations"):
-        ops.marlin_gemm(
-            a_bf16,
-            None,
-            q_w,
-            None,
-            scales_bf16,
-            None,
-            None,
-            None,
-            g_idx,
-            sort_indices,
-            workspace,
-            scalar_types.uint8b128.id,
-            a_bf16.shape[0],
-            w.shape[1],
-            w.shape[0],
-            True,
-            False,
-            True,
-            False,
-        )
-
-    a_bf16 = a.to(torch.bfloat16)
-    scales_bf16 = scales.to(torch.bfloat16)
-    with pytest.raises(RuntimeError, match="float16 outputs|float16 scales|float16 activations"):
-        ops.marlin_gemm(
-            a_bf16,
-            None,
-            q_w,
-            None,
-            scales_bf16,
-            None,
-            None,
-            None,
-            g_idx,
-            sort_indices,
-            workspace,
-            scalar_types.uint4b8.id,
-            a_bf16.shape[0],
             w.shape[1],
             w.shape[0],
             True,
