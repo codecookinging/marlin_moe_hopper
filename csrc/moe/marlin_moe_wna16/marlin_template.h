@@ -27,12 +27,7 @@
 #include "quantization/marlin/marlin_dtypes.cuh"
 #include "quantization/marlin/dequant.h"
 #include "quantization/marlin/marlin_mma.h"
-#include "marlin_hopper.cuh"
 #include "core/scalar_type.hpp"
-
-#ifndef MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
-  #define MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE 0
-#endif
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -92,8 +87,8 @@ __global__ void Marlin(
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared
 // memory, directly in tensor core layout.
 template <int count, vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void ldsm(
-    typename MarlinScalarType<type_id>::FragA& frag_a, const void* smem_ptr) {
+__device__ inline void ldsm(typename MarlinScalarType<type_id>::FragA& frag_a,
+                            const void* smem_ptr) {
   uint32_t* a = reinterpret_cast<uint32_t*>(&frag_a);
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   if constexpr (count == 4) {
@@ -117,9 +112,9 @@ __device__ __forceinline__ void ldsm(
 // Multiply dequantized values by the corresponding quantization scale; used
 // only for grouped quantization.
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void scale(
-    typename MarlinScalarType<type_id>::FragB& frag_b,
-    typename MarlinScalarType<type_id>::FragS& frag_s, int i) {
+__device__ inline void scale(typename MarlinScalarType<type_id>::FragB& frag_b,
+                             typename MarlinScalarType<type_id>::FragS& frag_s,
+                             int i) {
   using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
   using scalar_t2 = typename MarlinScalarType<type_id>::scalar_t2;
   scalar_t2 s = MarlinScalarType<type_id>::num2num2(
@@ -129,7 +124,7 @@ __device__ __forceinline__ void scale(
 }
 
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void scale_and_sub(
+__device__ inline void scale_and_sub(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::scalar_t s,
     typename MarlinScalarType<type_id>::scalar_t zp) {
@@ -142,7 +137,7 @@ __device__ __forceinline__ void scale_and_sub(
 }
 
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void sub_zp(
+__device__ inline void sub_zp(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::scalar_t2& frag_zp, int i) {
   using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
@@ -155,7 +150,7 @@ __device__ __forceinline__ void sub_zp(
 
 // Same as above, but for act_order (each K is multiplied individually)
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void scale4(
+__device__ inline void scale4(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::FragS& frag_s_1,
     typename MarlinScalarType<type_id>::FragS& frag_s_2,
@@ -178,7 +173,7 @@ __device__ __forceinline__ void scale4(
 
 // Given 2 floats multiply by 2 scales (halves)
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void scale_float(
+__device__ inline void scale_float(
     float* c, typename MarlinScalarType<type_id>::FragS& s) {
   using scalar_t = typename MarlinScalarType<type_id>::scalar_t;
   scalar_t* s_ptr = reinterpret_cast<scalar_t*>(&s);
@@ -187,7 +182,7 @@ __device__ __forceinline__ void scale_float(
 }
 
 // Wait until barrier reaches `count`, then lock for current threadblock.
-__device__ __forceinline__ void barrier_acquire(int* lock, int count) {
+__device__ inline void barrier_acquire(int* lock, int count) {
   if (threadIdx.x == 0) {
     int state = -1;
     do
@@ -202,7 +197,7 @@ __device__ __forceinline__ void barrier_acquire(int* lock, int count) {
 }
 
 // Release barrier and increment visitation count.
-__device__ __forceinline__ void barrier_release(int* lock, bool reset = false) {
+__device__ inline void barrier_release(int* lock, bool reset = false) {
   __syncthreads();
   if (threadIdx.x == 0) {
     if (reset) {
@@ -220,7 +215,7 @@ __device__ __forceinline__ void barrier_release(int* lock, bool reset = false) {
 }
 
 // Wait until value of lock to be negative, and then add 1
-__device__ __forceinline__ void wait_negative_and_add(int* lock) {
+__device__ inline void wait_negative_and_add(int* lock) {
   if (threadIdx.x == 0) {
     int state = 0;
     do
@@ -230,10 +225,7 @@ __device__ __forceinline__ void wait_negative_and_add(int* lock) {
                    : "=r"(state)
                    : "l"(lock));
     while (state >= 0);
-    int val = 1;
-    asm volatile("red.relaxed.gpu.global.add.s32 [%0], %1;\n"
-                 :
-                 : "l"(lock), "r"(val));
+    atomicAdd(lock, 1);
   }
   __syncthreads();
 }
@@ -256,9 +248,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
-__global__ void __launch_bounds__(
-    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::max_blocks_per_sm)
-    Marlin(
+__global__ void Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
     int4* __restrict__ C,        // fp16 output buffer of shape mxn
@@ -365,20 +355,6 @@ __global__ void __launch_bounds__(
   if constexpr (!is_a_8bit) {
     static_assert(std::is_same<scalar_t, c_scalar_t>::value);
   }
-
-  // SM90 fast path: prefer output atomics over the serialized global lock/reduce
-  // chain when split-K slices exist. Disabled by default; compile with
-  // -DMARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE=1 to enable.
-  bool effective_use_atomic_add = use_atomic_add;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && \
-    MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
-  if constexpr (!is_a_8bit) {
-    if (!use_fp32_reduce) {
-      effective_use_atomic_add = true;
-    }
-  }
-#endif
-
   constexpr bool has_zp = b_type == vllm::kU4 || b_type == vllm::kU8;
   constexpr bool is_int_type = b_type == vllm::kU4 || b_type == vllm::kU8 ||
                                b_type == vllm::kS4 || b_type == vllm::kS8 ||
@@ -407,7 +383,7 @@ __global__ void __launch_bounds__(
   const int b_bias_expert_stride = prob_n / 8;
 
   // parallel: num valid moe blocks
-  int parallel = num_tokens_past_padded / moe_block_size;   // MoE block 数量。token 先按 expert 排序、padding 后，每 moe_block_size 个 token 一块
+  int parallel = num_tokens_past_padded / moe_block_size;
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
@@ -617,8 +593,7 @@ __global__ void __launch_bounds__(
       locks_off++;
     }
 
-    if (first_init && effective_use_atomic_add && slice_count > 1 &&
-        slice_idx == 0) {
+    if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(block_num_valid_tokens, threads / threads_per_m);
@@ -975,17 +950,9 @@ __global__ void __launch_bounds__(
     if (is_async) {
       for (int i = 0; i < sh_num_groups; i++) {
         if (threadIdx.x < s_sh_stride) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-          // Scales are reused across the token batch — L2::128B hint.
-          marlin_hopper::cp_async4_l2_128(
-              &sh_s[(i * s_sh_stride) + threadIdx.x],
-              &scales_ptr[row_offset + (i * s_gl_stride) + slice_n_offset +
-                          threadIdx.x]);
-#else
           cp_async4_pred(&sh_s[(i * s_sh_stride) + threadIdx.x],
                          &scales_ptr[row_offset + (i * s_gl_stride) +
                                      slice_n_offset + threadIdx.x]);
-#endif
         }
       }
     } else {
@@ -1011,17 +978,8 @@ __global__ void __launch_bounds__(
           sorted_row = sh_rd_block_sorted_ids[row];
         int64_t true_idx =
             sorted_row * a_gl_stride + a_gl_rd_col + a_gl_rd_delta_o * a_off;
-        // SM90: activations are gathered one row at a time.  Keep the normal
-        // .cg policy so these scattered reads bypass L1 without adding L2
-        // prefetch traffic for data that is unlikely to be reused.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        marlin_hopper::cp_async4_pred_cg(&sh_a_stage[a_sh_wr_trans[i]],
-                                         &A[true_idx],
-                                         row < block_num_valid_tokens);
-#else
         cp_async4_pred(&sh_a_stage[a_sh_wr_trans[i]], &A[true_idx],
                        row < block_num_valid_tokens);
-#endif
       }
 
       int4* sh_b_stage = sh_b + b_sh_stage * pipe;
@@ -1032,13 +990,7 @@ __global__ void __launch_bounds__(
             b_gl_rd + (i % count) * threads +
             b_gl_stride * (i / count) * div_ceil(threads, b_sh_stride);
 
-        // SM90: weights are reused across the token batch — L2::128B hint.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-        marlin_hopper::cp_async4_l2_128(&sh_b_stage[threads * i + threadIdx.x],
-                                        &B[b_gl_idx]);
-#else
         cp_async4(&sh_b_stage[threads * i + threadIdx.x], &B[b_gl_idx]);
-#endif
       }
 
       b_gl_rd += b_gl_rd_delta_o;
@@ -1065,12 +1017,7 @@ __global__ void __launch_bounds__(
           // Only fetch scales if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (s_sh_wr_pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-              marlin_hopper::cp_async4_l2_128(&sh_s_stage[s_sh_wr],
-                                              &scales_ptr[s_gl_rd]);
-#else
               cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
-#endif
             }
             s_gl_rd += s_gl_rd_delta * s_tb_groups;
           }
@@ -1082,47 +1029,35 @@ __global__ void __launch_bounds__(
           // Only fetch zero points if this tile starts a new group
           if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
             if (zp_sh_wr_pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-              marlin_hopper::cp_async4_l2_128(&sh_zp_stage[zp_sh_wr],
-                                              &zp_ptr[zp_gl_rd]);
-#else
               cp_async4(&sh_zp_stage[zp_sh_wr], &zp_ptr[zp_gl_rd]);
-#endif
             }
             zp_gl_rd += zp_gl_rd_delta * zp_tb_groups;
           }
         }
       }
     }
+    // Insert a fence even when we are winding down the pipeline to ensure that
+    // waiting is also correct at this point.
     cp_async_fence();
   };
 
   auto fetch_col_zp_to_shared = [&]() {
     if (zp_sh_wr_pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      marlin_hopper::cp_async4_l2_128(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
-#else
       cp_async4(&sh_zp[zp_sh_wr], &zp_ptr[zp_gl_rd]);
-#endif
     }
   };
 
   auto fetch_col_scale_to_shared = [&]() {
     if (s_sh_wr_pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      marlin_hopper::cp_async4_l2_128(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
-#else
       cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
-#endif
     }
   };
 
   // Wait until the next thread tile has been loaded to shared memory.
-  auto wait_for_stage = [&](int wait_pipe = 0) {
-    (void)wait_pipe;
+  auto wait_for_stage = [&]() {
     // We only have `stages - 2` active fetches since we are double buffering
-    // and can only issue the next fetch when it is guaranteed that the
-    // previous shared memory load is fully complete (as it may otherwise be
+    // and can only issue the next fetch when it is guaranteed that the previous
+    // shared memory load is fully complete (as it may otherwise be
     // overwritten).
     cp_async_wait<stages - 2>();
     __syncthreads();
@@ -1942,7 +1877,7 @@ __global__ void __launch_bounds__(
         int64_t true_idx = sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
         c_scalar_t2 topk_weight_score;
         if (mul_topk_weights) topk_weight_score = sh_block_topk_weights[row];
-        if (effective_use_atomic_add && slice_count > 1 || mul_topk_weights) {
+        if (use_atomic_add && slice_count > 1 || mul_topk_weights) {
           c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[true_idx]);
           c_scalar_t2* sh_red_half2 =
               reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
@@ -1953,7 +1888,7 @@ __global__ void __launch_bounds__(
             }
           }
 
-          if (effective_use_atomic_add && slice_count > 1) {
+          if (use_atomic_add && slice_count > 1) {
   #pragma unroll
             for (int a = 0; a < 4; a++) {
               atomicAdd(&C_half2[a], sh_red_half2[a]);
@@ -1973,6 +1908,7 @@ __global__ void __launch_bounds__(
 
   // Start global fetch and register load pipelines.
   auto start_pipes = [&]() {
+
   #pragma unroll
     for (int i = 0; i < stages - 1; i++) {
       if (has_act_order && i == 0) {
@@ -1996,7 +1932,7 @@ __global__ void __launch_bounds__(
     }
 
     zero_accums();
-    wait_for_stage(0);
+    wait_for_stage();
     init_same_group(0);
     fetch_to_registers(0, 0);
     fetch_scales_to_registers(0, 0);
@@ -2028,7 +1964,7 @@ __global__ void __launch_bounds__(
           fetch_to_shared((pipe + stages - 1) % stages, pipe,
                           slice_iters >= stages);
           pipe++;
-          wait_for_stage(pipe);
+          wait_for_stage();
           init_same_group(pipe % stages);
         }
 
@@ -2125,18 +2061,10 @@ __global__ void __launch_bounds__(
       // write-out
       if constexpr (!has_act_order && group_blocks == -1 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
-        if (b_type.size_bits() == 8 || (last || effective_use_atomic_add) ||
-            is_a_8bit) {
+        if (b_type.size_bits() == 8 || (last || use_atomic_add) || is_a_8bit) {
           if (s_sh_wr_pred) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-            marlin_hopper::cp_async4_l2_128(&sh_s[s_sh_wr],
-                                            &scales_ptr[s_gl_rd]);
-#else
             cp_async4(&sh_s[s_sh_wr], &scales_ptr[s_gl_rd]);
-#endif
           }
-          // This fetch is outside the main K pipeline; use a regular
-          // commit-group fence before the existing wait path consumes it.
           cp_async_fence();
         }
       }
@@ -2158,8 +2086,7 @@ __global__ void __launch_bounds__(
           if (threadIdx.x / 32 < tb_n_warps) {
             reinterpret_cast<int4*>(&frag_s)[0] = sh_s[s_sh_rd + 0];
           }
-        } else if (b_type.size_bits() == 8 ||
-                   (last || effective_use_atomic_add)) {
+        } else if (b_type.size_bits() == 8 || (last || use_atomic_add)) {
           cp_async_wait<0>();
           __syncthreads();
           if (threadIdx.x / 32 < tb_n_warps) {
@@ -2232,7 +2159,7 @@ __global__ void __launch_bounds__(
         }
       }
 
-      if (slice_count > 1 && !effective_use_atomic_add) {
+      if (slice_count > 1 && !use_atomic_add) {
         // only globally reduce if there is more than one block in a slice
         barrier_acquire(&locks[locks_off], slice_idx);
         if (use_fp32_reduce) {
@@ -2252,9 +2179,9 @@ __global__ void __launch_bounds__(
         __syncthreads();
       }
 
-      if (effective_use_atomic_add && slice_count > 1 && slice_idx != 0)
+      if (use_atomic_add && slice_count > 1 && slice_idx != 0)
         wait_negative_and_add(&locks[locks_off]);
-      if (last || effective_use_atomic_add)
+      if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
       slice_row = 0;

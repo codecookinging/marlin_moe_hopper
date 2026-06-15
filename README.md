@@ -91,7 +91,7 @@ PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace
 可用下面的方式做最小导入检查：
 
 ```bash
-PYTHONPATH=$PWD/python ./.venv/bin/python - <<'PY'
+PYTHONPATH=$PWD/python python3 - <<'PY'
 import marlin_v100
 import marlin_v100._C
 import marlin_v100._moe_C
@@ -109,9 +109,9 @@ PY
 - `import marlin_v100`
 - `import marlin_v100._C`
 - `import marlin_v100._moe_C`
-- `PYTHONPATH=$PWD/python ./.venv/bin/pytest -q tests/test_marlin_generators.py`
-- `PYTHONPATH=$PWD/python ./.venv/bin/pytest -q tests/test_marlin_dense.py tests/test_marlin_moe.py`
-- `PYTHONPATH=$PWD/python ./.venv/bin/pytest -q`
+- `PYTHONPATH=$PWD/python pytest -q tests/test_marlin_generators.py`
+- `PYTHONPATH=$PWD/python pytest -q tests/test_marlin_dense.py tests/test_marlin_moe.py`
+- `PYTHONPATH=$PWD/python pytest -q`
 
 ## 当前限制
 

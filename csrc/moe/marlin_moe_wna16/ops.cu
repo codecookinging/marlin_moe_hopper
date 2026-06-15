@@ -31,20 +31,6 @@
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
 
-static bool effective_use_atomic_add_host(int dev, bool is_a_8bit,
-                                          bool use_fp32_reduce,
-                                          bool use_atomic_add) {
-#if MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
-  if (!is_a_8bit && !use_fp32_reduce) {
-    int major_capability = 0;
-    cudaDeviceGetAttribute(&major_capability,
-                           cudaDevAttrComputeCapabilityMajor, dev);
-    if (major_capability >= 9) return true;
-  }
-#endif
-  return use_atomic_add;
-}
-
 namespace MARLIN_NAMESPACE_NAME {
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
@@ -283,7 +269,7 @@ exec_config_t determine_exec_config(
     int prob_n, int prob_k, int num_experts, int top_k, int thread_m_blocks,
     bool m_block_size_8, int num_bits, int group_size, bool has_act_order,
     bool is_k_full, bool has_zp, bool is_zp_float, bool is_a_8bit, int stages,
-    int max_shared_mem, int sms, bool is_sm90) {
+    int max_shared_mem, int sms) {
   exec_config_t exec_cfg = exec_config_t{1, thread_config_t{-1, -1, -1}};
   thread_config_t* thread_configs = thread_m_blocks > 1
                                         ? large_batch_thread_configs
@@ -328,20 +314,10 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    int max_blocks_per_sm = 1;
-    if (is_sm90) {
-      if (thread_m_blocks == 1) {
-        max_blocks_per_sm = th_config.num_threads >= 256 ? 6 : 5;
-      } else {
-        max_blocks_per_sm = 3;
-      }
-    } else {
-      if (thread_m_blocks == 1)
-        max_blocks_per_sm = 4;
-      else
-        max_blocks_per_sm = 2;
-    }
-    allow_count = max(min(allow_count, max_blocks_per_sm), 1);
+    if (thread_m_blocks == 1)
+      allow_count = max(min(allow_count, 4), 1);
+    else
+      allow_count = max(min(allow_count, 2), 1);
 
     if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
       allow_count =
@@ -461,19 +437,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
-  // Default pipeline depth: 2 on Turing, 4 on Ampere/Ada, 5 on Hopper.
-  // SM90 (H100) has ~228 KB opt-in shared memory vs ~164 KB on SM80, which
-  // fits one extra pipeline stage and hides more global-memory latency.
-  // The autotuning below will fall back to stages=4 if a stages=5 config is
-  // not found (e.g. because the combination of thread_n / thread_k is such
-  // that 5 stages still exceeds the smem budget for that tile).
   int stages = 4;
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
     TORCH_CHECK(a_type == vllm::kFloat16 || a_type == vllm::kS8,
                 "Turing only support FP16 or INT8 activation.");
-  } else if (major_capability >= 9) {
-    stages = 5;
   }
   if (a_type == vllm::kFE4M3fn) {
     TORCH_CHECK(major_capability * 10 + minor_capability >= 89,
@@ -498,22 +466,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                 " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
-    bool is_sm90 = major_capability >= 9;
     exec_cfg = determine_exec_config(
         a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
         top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
         has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
-        max_shared_mem, sms, is_sm90);
-    // On SM90+ we prefer stages=5 but fall back to stages=4 when the chosen
-    // tile configuration does not fit in shared memory at depth 5.
-    if (is_sm90 && stages == 5 && exec_cfg.tb_cfg.thread_k == -1) {
-      stages = 4;
-      exec_cfg = determine_exec_config(
-          a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
-          top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
-          has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
-          max_shared_mem, sms, is_sm90);
-    }
+        max_shared_mem, sms);
     thread_tfg = exec_cfg.tb_cfg;
   }
 
@@ -540,9 +497,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
               ", has_act_order = ", has_act_order, ", is_k_full = ", is_k_full,
               ", has_zp = ", has_zp, ", is_zp_float = ", is_zp_float,
               ", max_shared_mem = ", max_shared_mem);
-
-  use_atomic_add =
-      effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
   int sh_cache_size =
       get_kernel_cache_size(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
@@ -733,10 +687,6 @@ torch::Tensor moe_wna16_marlin_gemm(
     c = torch::empty({size_m * top_k, size_n}, options);
   }
 
-  int dev = a.get_device();
-  use_atomic_add = effective_use_atomic_add_host(
-      dev, a_type.size_bits() == 8, use_fp32_reduce, use_atomic_add);
-
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
@@ -890,6 +840,8 @@ torch::Tensor moe_wna16_marlin_gemm(
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
+
+  int dev = a.get_device();
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
