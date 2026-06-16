@@ -24,6 +24,7 @@
 #endif
 
 #include "kernel.h"
+#include "marlin_streamk_schedule.h"
 #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -522,13 +523,27 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
 
+    int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
+    int parallel = 1;
+    if (prob_m_split > m_block_size) {
+      parallel = prob_m_split / m_block_size;
+    }
+    int n_tiles = prob_n / thread_n;
+    int k_tiles = prob_k / thread_k;
+    int global_mn_tiles = parallel * n_tiles;
+    marlin_schedule::MarlinStreamKSchedule sk =
+        marlin_schedule::compute_marlin_streamk_schedule(
+            global_mn_tiles, k_tiles, blocks, group_blocks, thread_k_blocks,
+            has_act_order);
+
     // avoid ">>>" being formatted to "> > >"
     // clang-format off
     kernel<<<blocks, num_threads, max_shared_mem_new, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr,
         g_idx_ptr, num_groups,
         prob_m_split, prob_n, prob_k, lda, locks, has_bias, part_use_atomic_add,
-        use_fp32_reduce, max_shared_mem_new);
+        use_fp32_reduce, max_shared_mem_new, sk.part2_mn_tiles, sk.part1_mn_iters,
+        sk.slice_iters);
     // clang-format on
 
     bool is_a_8bit = a_type.size_bits() == 8;

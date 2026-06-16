@@ -289,8 +289,8 @@ __global__ void __launch_bounds__(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
-) {
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    int sk_part2_mn_tiles, int sk_part1_mn_iters, int sk_slice_iters) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -413,31 +413,12 @@ __global__ void __launch_bounds__(
   int n_tiles = prob_n / 16 / thread_n_blocks;
 
   int global_mn_tiles = parallel * n_tiles;
-  int part2_mn_tiles = global_mn_tiles;
-  int part1_mn_iters = 0;
+  int part2_mn_tiles = sk_part2_mn_tiles;
+  int part1_mn_iters = sk_part1_mn_iters;
   bool in_part2 = false;
 
-  // we use DP + two-tile SK here
-  // part1: DP
-  // part2: two-tile SK
-  // see https://github.com/vllm-project/vllm/pull/24722 for more details
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
-  }
-
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
-
-  if constexpr (!has_act_order && group_blocks != -1) {
-    if (group_blocks >= thread_k_blocks) {
-      // Ensure that the number of tiles in each stripe is a multiple of the
-      // groupsize; this avoids an annoying special case where a stripe starts
-      // in the middle of group.
-      iters = (group_blocks / thread_k_blocks) *
-              div_ceil(iters, (group_blocks / thread_k_blocks));
-    }
-  }
+  // Host-side Stream-K++ schedule (marlin_streamk_schedule.h).
+  int iters = sk_slice_iters;
 
   int slice_row = 0;
   int slice_col_par = blockIdx.x;

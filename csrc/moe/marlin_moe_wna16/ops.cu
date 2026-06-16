@@ -24,6 +24,7 @@
 #endif
 
 #include "kernel.h"
+#include "quantization/marlin/marlin_streamk_schedule.h"
 #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -544,6 +545,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   use_atomic_add =
       effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
+  int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
+  int parallel = num_tokens_past_padded / moe_block_size;
+  int n_tiles = prob_n / thread_n;
+  int k_tiles = prob_k / thread_k;
+  int global_mn_tiles = parallel * n_tiles;
+  marlin_schedule::MarlinStreamKSchedule sk =
+      marlin_schedule::compute_marlin_streamk_schedule(
+          global_mn_tiles, k_tiles, blocks, group_blocks, thread_k_blocks,
+          has_act_order);
+
   int sh_cache_size =
       get_kernel_cache_size(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
                             prob_n, prob_k, num_bits, group_size, has_act_order,
@@ -572,7 +583,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+      sk.part2_mn_tiles, sk.part1_mn_iters, sk.slice_iters);
   // clang-format on
 }
 
