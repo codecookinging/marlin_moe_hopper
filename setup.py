@@ -36,6 +36,17 @@ class CMakeExtension(Extension):
 
 
 class CMakeBuild(build_ext):
+    def _resolve_build_type(self) -> str:
+        other_cmake_args = os.environ.get("CMAKE_ARGS", "")
+        for arg in parse_cmake_args(other_cmake_args):
+            if arg.startswith("-DCMAKE_BUILD_TYPE="):
+                return arg.split("=", 1)[1]
+        if os.environ.get("MARLIN_DEBUG", "").lower() in ("1", "true", "yes", "on"):
+            return "Debug"
+        if self.debug:
+            return "Debug"
+        return "Release"
+
     def build_extensions(self) -> None:
         subprocess.check_call(["cmake", "--version"])
 
@@ -44,6 +55,7 @@ class CMakeBuild(build_ext):
 
         cmake_args = [
             f"-DVLLM_PYTHON_EXECUTABLE={sys.executable}",
+            f"-DCMAKE_BUILD_TYPE={self._resolve_build_type()}",
         ]
         other_cmake_args = os.environ.get("CMAKE_ARGS")
         if other_cmake_args:
