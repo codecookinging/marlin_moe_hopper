@@ -545,8 +545,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   use_atomic_add =
       effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
-  int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
-  int parallel = num_tokens_past_padded / moe_block_size;
+  int num_tokens_past_padded_count = num_tokens_past_padded_ptr[0];
+  int parallel = num_tokens_past_padded_count / moe_block_size;
   int n_tiles = prob_n / thread_n;
   int k_tiles = prob_k / thread_k;
   int global_mn_tiles = parallel * n_tiles;
