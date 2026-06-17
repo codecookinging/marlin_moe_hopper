@@ -4,7 +4,12 @@
 """A/B microbenchmark for Marlin MoE kernel changes.
 
 This script benchmarks `fused_marlin_moe` with fixed synthetic workloads and
-reports per-case latency stats (mean/p50/p95/std) using CUDA events.
+reports per-case latency stats using CUDA events.
+
+Timing modes (`--timing`):
+- event (default): one CUDA event pair per repeat; reports mean/p50/p95/std.
+- batch: one event pair around all repeats; reports average latency (fast
+  sanity checks / stable prefill regression).
 
 Default workloads target zai-org/GLM-5 at tensor-parallel size 8
 (K=6144, N=256, E=256, topk=8). Use `--model generic` for legacy shapes,
@@ -523,10 +528,11 @@ def _run_one_case(
     warmup: int,
     repeat: int,
     seed: int,
+    timing: str,
 ) -> dict[str, Any]:
     _lazy_imports()
     with torch.inference_mode():
-        return _run_one_case_impl(case, warmup, repeat, seed)
+        return _run_one_case_impl(case, warmup, repeat, seed, timing)
 
 
 def _run_one_case_impl(
@@ -534,6 +540,7 @@ def _run_one_case_impl(
     warmup: int,
     repeat: int,
     seed: int,
+    timing: str,
 ) -> dict[str, Any]:
     tensors = _build_case_tensors(case, seed=seed)
 
@@ -565,6 +572,28 @@ def _run_one_case_impl(
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
+    if timing == "batch":
+        start_event.record()
+        for _ in range(repeat):
+            _kernel_call()
+        end_event.record()
+        end_event.synchronize()
+        total_us = start_event.elapsed_time(end_event) * 1000.0
+        avg_us = total_us / repeat
+        return {
+            "case": dataclasses.asdict(case),
+            "timing": timing,
+            "samples_us": [],
+            "total_us": total_us,
+            "mean_us": avg_us,
+            # A/B gates key off p50/p95; in batch mode they equal the average.
+            "p50_us": avg_us,
+            "p95_us": avg_us,
+            "std_us": 0.0,
+            "min_us": avg_us,
+            "max_us": avg_us,
+        }
+
     samples_us: list[float] = []
     for _ in range(repeat):
         start_event.record()
@@ -580,6 +609,7 @@ def _run_one_case_impl(
     std = statistics.pstdev(samples_us) if len(samples_us) > 1 else 0.0
     return {
         "case": dataclasses.asdict(case),
+        "timing": timing,
         "samples_us": samples_us,
         "mean_us": mean,
         "p50_us": p50,
@@ -595,6 +625,7 @@ def _run_single(
     warmup: int,
     repeat: int,
     seed: int,
+    timing: str,
 ) -> dict[str, Any]:
     _lazy_imports()
     if not torch.cuda.is_available():
@@ -602,13 +633,16 @@ def _run_single(
     _ = torch.cuda.get_device_name(0)
     results = []
     for idx, case in enumerate(cases):
-        result = _run_one_case(case, warmup=warmup, repeat=repeat, seed=seed + idx)
+        result = _run_one_case(
+            case, warmup=warmup, repeat=repeat, seed=seed + idx, timing=timing
+        )
         results.append(result)
     return {
         "gpu_name": torch.cuda.get_device_name(0),
         "cuda_device_capability": torch.cuda.get_device_capability(0),
         "warmup": warmup,
         "repeat": repeat,
+        "timing": timing,
         "results": results,
     }
 
@@ -647,14 +681,30 @@ def _case_key(case_obj: dict[str, Any]) -> str:
 
 def _print_single_report(report: dict[str, Any]) -> None:
     model = report.get("model", "?")
+    timing = report.get("timing", "event")
     print(f"Benchmark suite: {report.get('benchmark_suite_id', BENCHMARK_SUITE_ID)}")
     print(f"Model preset: {model} ({report.get('model_description', '')})")
     print(
         f"GPU: {report['gpu_name']}  "
         f"SM: {tuple(report['cuda_device_capability'])}  "
-        f"warmup={report['warmup']} repeat={report['repeat']}"
+        f"warmup={report['warmup']} repeat={report['repeat']} timing={timing}"
     )
     print("-" * 150)
+    if timing == "batch":
+        print(
+            f"{'case':32} {'M':>5} {'N':>5} {'K':>5} {'E':>4} {'tk':>3} "
+            f"{'avg(us)':>10} {'total(ms)':>10}"
+        )
+        for row in report["results"]:
+            c = row["case"]
+            total_ms = row.get("total_us", row["mean_us"] * report["repeat"]) / 1000.0
+            print(
+                f"{c['name']:32} {c['m']:5d} {c['n']:5d} {c['k']:5d} "
+                f"{c['e']:4d} {c['topk']:3d} "
+                f"{row['mean_us']:10.2f} {total_ms:10.2f}"
+            )
+        return
+
     print(
         f"{'case':32} {'M':>5} {'N':>5} {'K':>5} {'E':>4} {'tk':>3} "
         f"{'mean(us)':>10} {'p50(us)':>10} {'p95(us)':>10} {'std(us)':>10}"
@@ -808,6 +858,7 @@ def _spawn_single_run(
     warmup: int,
     repeat: int,
     seed: int,
+    timing: str,
     output_json: Path,
     case_names: list[str],
     model: str,
@@ -827,6 +878,8 @@ def _spawn_single_run(
         str(repeat),
         "--seed",
         str(seed),
+        "--timing",
+        timing,
         "--model",
         model,
         "--output-json",
@@ -892,6 +945,15 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--repeat", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument(
+        "--timing",
+        choices=["event", "batch"],
+        default="event",
+        help=(
+            "event: per-repeat CUDA events (mean/p50/p95/std). "
+            "batch: one event around all repeats (average latency)."
+        ),
+    )
     parser.add_argument(
         "--cases",
         nargs="*",
@@ -968,7 +1030,11 @@ def main() -> None:
     if args.mode == "single":
         _print_case_plan(args.model, cases)
         report = _run_single(
-            cases, warmup=args.warmup, repeat=args.repeat, seed=args.seed
+            cases,
+            warmup=args.warmup,
+            repeat=args.repeat,
+            seed=args.seed,
+            timing=args.timing,
         )
         report["model"] = args.model
         report["benchmark_suite_id"] = BENCHMARK_SUITE_ID
@@ -993,12 +1059,14 @@ def main() -> None:
                         "is_k_full": c["is_k_full"],
                         "dtype": c["dtype"],
                         "weight": c.get("weight"),
+                        "timing": row.get("timing", args.timing),
                         "mean_us": row["mean_us"],
                         "p50_us": row["p50_us"],
                         "p95_us": row["p95_us"],
                         "std_us": row["std_us"],
                         "min_us": row["min_us"],
                         "max_us": row["max_us"],
+                        "total_us": row.get("total_us"),
                     }
                 )
             _write_csv(Path(args.output_csv), csv_rows)
@@ -1036,6 +1104,7 @@ def main() -> None:
             warmup=args.warmup,
             repeat=args.repeat,
             seed=args.seed,
+            timing=args.timing,
             output_json=base_json,
             case_names=selected_case_names,
             model=args.model,
@@ -1046,6 +1115,7 @@ def main() -> None:
             warmup=args.warmup,
             repeat=args.repeat,
             seed=args.seed,
+            timing=args.timing,
             output_json=cand_json,
             case_names=selected_case_names,
             model=args.model,
