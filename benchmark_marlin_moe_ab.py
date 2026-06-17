@@ -358,7 +358,7 @@ def _lazy_imports() -> None:
     global torch
     if torch is not None:
         return
-    _ensure_import_paths()
+    # _ensure_import_paths()
     import torch as _torch
 
     torch = _torch
