@@ -12,6 +12,20 @@ from setuptools.command.build_ext import build_ext
 
 ROOT_DIR = Path(__file__).parent.resolve()
 
+GENERATED_KERNEL_DIRS = (
+    ROOT_DIR / "csrc/quantization/marlin",
+    ROOT_DIR / "csrc/moe/marlin_moe_wna16",
+)
+
+
+def clean_generated_marlin_kernels() -> None:
+    """Remove gitignored kernel stubs that survive branch switches."""
+    for directory in GENERATED_KERNEL_DIRS:
+        for path in directory.glob("*kernel_*.cu"):
+            path.unlink(missing_ok=True)
+        selector = directory / "kernel_selector.h"
+        selector.unlink(missing_ok=True)
+
 
 def parse_cmake_args(raw_args: str) -> list[str]:
     args = shlex.split(raw_args)
@@ -49,6 +63,8 @@ class CMakeBuild(build_ext):
 
     def build_extensions(self) -> None:
         subprocess.check_call(["cmake", "--version"])
+
+        clean_generated_marlin_kernels()
 
         build_temp = Path(self.build_temp)
         build_temp.mkdir(parents=True, exist_ok=True)

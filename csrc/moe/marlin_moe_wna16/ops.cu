@@ -46,8 +46,11 @@ static int moe_schedule_lock_slots(int global_mn_tiles, int k_tiles, int grid,
       marlin_schedule::compute_marlin_streamk_schedule(
           global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
           has_act_order);
-  // locks_off is blockIdx.x when part2 spans the full grid; otherwise it
-  // advances with part2 slice columns and can reach part2_mn_tiles.
+  // When part2 spans the full grid, locks_off is blockIdx.x (max grid - 1).
+  if (sk.part2_mn_tiles >= grid) {
+    return grid;
+  }
+  // Otherwise locks_off advances with part2 slice columns.
   return std::max(grid, sk.part2_mn_tiles + 1);
 }
 
@@ -417,8 +420,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float,
-               int num_tokens_past_padded_count) {
+               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -593,10 +595,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   use_atomic_add =
       effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
-  int parallel = num_tokens_past_padded_count / moe_block_size;
+  TORCH_CHECK(parallel_moe_blocks > 0, "parallel_moe_blocks must be > 0, got ",
+              parallel_moe_blocks);
   int n_tiles = prob_n / thread_n;
   int k_tiles = prob_k / thread_k;
-  int global_mn_tiles = parallel * n_tiles;
+  int global_mn_tiles = parallel_moe_blocks * n_tiles;
   marlin_schedule::MarlinStreamKSchedule sk =
       marlin_schedule::compute_marlin_streamk_schedule(
           global_mn_tiles, k_tiles, blocks, group_blocks, thread_k_blocks,
@@ -947,7 +950,23 @@ torch::Tensor moe_wna16_marlin_gemm(
   if (!has_act_order) {
     group_blocks = group_size == -1 ? -1 : (group_size / 16);
   }
-  int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
+
+  TORCH_CHECK(num_tokens_past_padded.defined() &&
+                  num_tokens_past_padded.numel() == 1,
+              "num_tokens_past_padded must be a scalar tensor");
+  TORCH_CHECK(num_tokens_past_padded.scalar_type() == at::ScalarType::Int,
+              "num_tokens_past_padded must be int32");
+  int num_tokens_past_padded_count =
+      num_tokens_past_padded.to(torch::kCPU).item<int>();
+  TORCH_CHECK(num_tokens_past_padded_count >= 0,
+              "num_tokens_past_padded must be non-negative, got ",
+              num_tokens_past_padded_count);
+  int parallel_moe_blocks =
+      num_tokens_past_padded_count / static_cast<int>(moe_block_size);
+  TORCH_CHECK(parallel_moe_blocks > 0,
+              "parallel_moe_blocks must be > 0, got ", parallel_moe_blocks,
+              " from num_tokens_past_padded=", num_tokens_past_padded_count,
+              ", moe_block_size=", moe_block_size);
 
   int min_workspace_size = moe_min_workspace_size(
       sorted_token_ids.size(0), moe_block_size, size_n, size_k, sms, dev,
@@ -978,7 +997,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, num_tokens_past_padded_count);
+      is_zp_float, parallel_moe_blocks);
 
   return c;
 }
