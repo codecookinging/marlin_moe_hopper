@@ -2,24 +2,11 @@
 
 #include <algorithm>
 
-// Host-side Stream-K++ inspired schedule selection for Marlin's DP + split-K
-// hybrid (see vLLM #24722 and Stream-K / Stream-K++ papers).  Maps the seven
-// policy families to part2 MN tail sizing; full Bloom-filter tuning can replace
-// select_streamk_policy() later.
+#include "marlin_streamk_opensieve.h"
 
 namespace marlin_schedule {
 
 inline int div_ceil(int a, int b) { return (a + b - 1) / b; }
-
-enum StreamKPolicy : int {
-  kDataParallel = 0,
-  kDpOneTileSk = 1,
-  kTwoTileSkDp = 2,
-  kThreeTileSkDp = 3,
-  kFourTileSkDp = 4,
-  kFiveTileSkDp = 5,
-  kSixTileSkDp = 6,
-};
 
 struct MarlinStreamKSchedule {
   int part2_mn_tiles;
@@ -51,31 +38,7 @@ inline int streamk_expand_threshold(StreamKPolicy policy) {
 
 inline StreamKPolicy select_streamk_policy(int global_mn_tiles, int k_tiles,
                                              int grid_dim) {
-  if (global_mn_tiles <= grid_dim) {
-    return kDataParallel;
-  }
-
-  const int tail = global_mn_tiles % grid_dim;
-  const int mn_waves = div_ceil(global_mn_tiles, grid_dim);
-  const int total_k_iters = k_tiles * global_mn_tiles;
-  const int iters_per_block = div_ceil(total_k_iters, grid_dim);
-
-  if (tail == 0 && mn_waves >= 2) {
-    return kDpOneTileSk;
-  }
-  if (k_tiles >= 32 && mn_waves >= 4) {
-    return kFourTileSkDp;
-  }
-  if (k_tiles >= 16 && mn_waves >= 3 && iters_per_block >= k_tiles / 2) {
-    return kThreeTileSkDp;
-  }
-  if (k_tiles <= 4) {
-    return kTwoTileSkDp;
-  }
-  if (mn_waves >= 2 && iters_per_block >= k_tiles) {
-    return kFiveTileSkDp;
-  }
-  return kTwoTileSkDp;
+  return opensieve::select_streamk_policy(global_mn_tiles, k_tiles, grid_dim);
 }
 
 inline MarlinStreamKSchedule compute_marlin_streamk_schedule(
