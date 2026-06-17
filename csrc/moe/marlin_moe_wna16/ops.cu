@@ -32,6 +32,24 @@
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
 
+static int moe_max_blocks_per_sm(int dev) {
+  int major_capability = 0;
+  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
+                         dev);
+  return major_capability >= 9 ? 6 : 4;
+}
+
+static int moe_min_workspace_size(int sorted_token_ids_len, int moe_block_size,
+                                  int size_n, int sms, int dev) {
+  int parallel = sorted_token_ids_len / moe_block_size;
+  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+  int legacy = std::min(max_n_tiles * parallel, sms * 4);
+  // Stream-K++ lock indices scale with the launched grid (sms * blocks_per_sm),
+  // which can exceed sms * 4 on SM90; size workspace for the full grid.
+  int streamk_locks = sms * moe_max_blocks_per_sm(dev);
+  return std::max(legacy, streamk_locks);
+}
+
 static bool effective_use_atomic_add_host(int dev, bool is_a_8bit,
                                           bool use_fp32_reduce,
                                           bool use_atomic_add) {
@@ -752,10 +770,10 @@ torch::Tensor moe_wna16_marlin_gemm(
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
-    // max num of threadblocks is sms * 4
     long max_c_tmp_size = min(
         (long)size_n * sorted_token_ids.size(0),
-        (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
+        (long)sms * moe_max_blocks_per_sm(dev) * moe_block_size *
+            MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
     c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
   } else {
@@ -896,9 +914,8 @@ torch::Tensor moe_wna16_marlin_gemm(
               "size_n = ", size_n, ", is not divisible by min_thread_n = ",
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
-  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int min_workspace_size = min(
-      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+  int min_workspace_size = moe_min_workspace_size(
+      sorted_token_ids.size(0), moe_block_size, size_n, sms, dev);
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
