@@ -3,8 +3,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A/B microbenchmark for Marlin MoE kernel changes.
 
-This script benchmarks `fused_marlin_moe` with fixed synthetic workloads and
-reports per-case latency stats using CUDA events.
+This script benchmarks `marlin_v100.moe.fused_marlin_moe` with fixed synthetic
+workloads and reports per-case latency stats using CUDA events.
+
+Uses `tests.helpers` for quantization and `marlin_v100` for MoE/routing.
+Requires `PYTHONPATH=$PWD/python` (repo root is added automatically for
+`tests.helpers`).
 
 Timing modes (`--timing`):
 - event (default): one CUDA event pair per repeat; reports mean/p50/p95/std.
@@ -14,6 +18,8 @@ Timing modes (`--timing`):
 Default workloads target zai-org/GLM-5 at tensor-parallel size 8
 (K=6144, N=256, E=256, topk=8). Use `--model generic` for legacy shapes,
 or `--model glm5_tp1` for the unsharded intermediate size.
+
+Only `act_order=False` and `is_k_full=True` cases are supported locally.
 
 Modes:
 1) single: benchmark one codebase
@@ -89,7 +95,7 @@ class ModelPreset:
     topk: int
     tp_size: int = 1
     group_size: int = 128
-    act_order: bool = True
+    act_order: bool = False
     dtype: str = "bfloat16"
     decode_ms: tuple[int, ...] = (1, 2, 4, 8)
     small_batch_ms: tuple[int, ...] = (16, 32, 64)
@@ -335,37 +341,34 @@ def cases_for_model(model: str) -> list[MarlinMoECase]:
 
 DEFAULT_CASES: list[MarlinMoECase] = cases_for_model("glm5")
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
 torch = None
-fused_topk = None
-fused_marlin_moe = None
-marlin_quantize = None
-scalar_types = None
-set_random_seed = None
+
+
+def _ensure_import_paths() -> None:
+    repo = str(_REPO_ROOT)
+    python = str(_REPO_ROOT / "python")
+    for path in (python, repo):
+        if path not in sys.path:
+            sys.path.insert(0, path)
 
 
 def _lazy_imports() -> None:
-    global torch, fused_topk, fused_marlin_moe, marlin_quantize, scalar_types
-    global set_random_seed
+    global torch
     if torch is not None:
         return
+    _ensure_import_paths()
     import torch as _torch
 
-    from vllm.model_executor.layers.fused_moe import fused_topk as _fused_topk
-    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
-        fused_marlin_moe as _fused_marlin_moe,
-    )
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-        marlin_quantize as _marlin_quantize,
-    )
-    from vllm.scalar_type import scalar_types as _scalar_types
-    from vllm.utils.torch_utils import set_random_seed as _set_random_seed
-
     torch = _torch
-    fused_topk = _fused_topk
-    fused_marlin_moe = _fused_marlin_moe
-    marlin_quantize = _marlin_quantize
-    scalar_types = _scalar_types
-    set_random_seed = _set_random_seed
+
+
+def _set_random_seed(seed: int) -> None:
+    _lazy_imports()
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _describe_preset(model: str) -> str:
@@ -400,6 +403,16 @@ def _print_case_plan(model: str, cases: list[MarlinMoECase]) -> None:
 
 
 def _validate_case_selection(model: str, cases: list[MarlinMoECase]) -> None:
+    unsupported = [
+        case.name
+        for case in cases
+        if case.act_order or not case.is_k_full
+    ]
+    if unsupported:
+        raise ValueError(
+            "Local marlin_v100 benchmark supports act_order=False and "
+            f"is_k_full=True only. Unsupported cases: {unsupported}"
+        )
     if model == "generic":
         return
     legacy_hits = [case.name for case in cases if case.name in LEGACY_CASE_NAMES]
@@ -424,10 +437,24 @@ def _validate_case_selection(model: str, cases: list[MarlinMoECase]) -> None:
 
 
 def _resolve_benchmark_script(root: Path) -> Path:
+    local_script = root / "benchmark_marlin_moe_ab.py"
+    if local_script.is_file():
+        return local_script.resolve()
     script_in_root = root / "benchmarks/kernels/benchmark_marlin_moe_ab.py"
     if script_in_root.is_file():
         return script_in_root.resolve()
     return Path(__file__).resolve()
+
+
+def _require_moe_extension() -> None:
+    _lazy_imports()
+    from marlin_v100 import moe, ops
+
+    ops._load_moe()
+    print(
+        "MoE kernel: "
+        f"{moe.fused_marlin_moe.__module__}.{moe.fused_marlin_moe.__qualname__}"
+    )
 
 
 def _percentile(sorted_values: list[float], q: float) -> float:
@@ -458,55 +485,29 @@ def _case_weight(case: dict[str, Any]) -> float:
     return float(case["m"] * case["n"] * case["k"] * case["topk"])
 
 
-def _quantize_marlin_expert_weights(
-    w: torch.Tensor,
-    group_size: int,
-    act_order: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-    _lazy_imports()
-    qweight_l: list[torch.Tensor] = []
-    scales_l: list[torch.Tensor] = []
-    g_idx_l: list[torch.Tensor] = []
-    sort_indices_l: list[torch.Tensor] = []
-    for i in range(w.shape[0]):
-        _w_ref, qweight, scales, g_idx, sort_indices, _perm = marlin_quantize(
-            w[i].transpose(1, 0),
-            scalar_types.uint4b8,
-            group_size,
-            act_order,
-        )
-        qweight_l.append(qweight)
-        scales_l.append(scales)
-        if act_order:
-            g_idx_l.append(g_idx)
-            sort_indices_l.append(sort_indices)
-    qweight = torch.stack(qweight_l).contiguous()
-    scales = torch.stack(scales_l).contiguous()
-    g_idx = torch.stack(g_idx_l).contiguous() if g_idx_l else None
-    sort_indices = (
-        torch.stack(sort_indices_l).contiguous() if sort_indices_l else None
-    )
-    return qweight, scales, g_idx, sort_indices
-
-
 def _build_case_tensors(case: MarlinMoECase, seed: int) -> dict[str, Any]:
     _lazy_imports()
-    set_random_seed(seed)
+    from marlin_v100 import moe, routing
+    from tests.helpers import marlin_quantize_experts, scalar_types
+
+    _set_random_seed(seed)
     dtype = _dtype_from_name(case.dtype)
     device = torch.device("cuda")
 
     a = torch.randn((case.m, case.k), device=device, dtype=dtype) / 10
-    w1 = torch.randn((case.e, 2 * case.n, case.k), device=device, dtype=dtype) / 10
-    w2 = torch.randn((case.e, case.k, case.n), device=device, dtype=dtype) / 10
+    w1 = torch.randn((case.e, case.k, 2 * case.n), device=device, dtype=dtype) / 10
+    w2 = torch.randn((case.e, case.n, case.k), device=device, dtype=dtype) / 10
     scores = torch.randn((case.m, case.e), device=device, dtype=dtype)
 
-    w1_qweight, w1_scales, w1_g_idx, w1_sort_indices = _quantize_marlin_expert_weights(
-        w1, case.group_size, case.act_order
+    w1_qweight, w1_scales, _w1_dequant = marlin_quantize_experts(
+        w1, scalar_types.uint4b8, case.group_size, act_order=False
     )
-    w2_qweight, w2_scales, w2_g_idx, w2_sort_indices = _quantize_marlin_expert_weights(
-        w2, case.group_size, case.act_order
+    w2_qweight, w2_scales, _w2_dequant = marlin_quantize_experts(
+        w2, scalar_types.uint4b8, case.group_size, act_order=False
     )
-    topk_weights, topk_ids, _ = fused_topk(a, scores, case.topk, False)
+    topk_weights, topk_ids, _ = routing.topk_softmax(
+        scores, case.topk, renormalize=False
+    )
 
     return {
         "a": a,
@@ -514,12 +515,11 @@ def _build_case_tensors(case: MarlinMoECase, seed: int) -> dict[str, Any]:
         "w2_qweight": w2_qweight,
         "w1_scales": w1_scales,
         "w2_scales": w2_scales,
-        "w1_g_idx": w1_g_idx,
-        "w2_g_idx": w2_g_idx,
-        "w1_sort_indices": w1_sort_indices,
-        "w2_sort_indices": w2_sort_indices,
         "topk_weights": topk_weights,
         "topk_ids": topk_ids,
+        "quant_type_id": scalar_types.uint4b8.id,
+        "fused_marlin_moe": moe.fused_marlin_moe,
+        "is_k_full": case.is_k_full,
     }
 
 
@@ -545,24 +545,16 @@ def _run_one_case_impl(
     tensors = _build_case_tensors(case, seed=seed)
 
     def _kernel_call() -> torch.Tensor:
-        return fused_marlin_moe(
+        return tensors["fused_marlin_moe"](
             hidden_states=tensors["a"],
             w1=tensors["w1_qweight"],
             w2=tensors["w2_qweight"],
-            bias1=None,
-            bias2=None,
             w1_scale=tensors["w1_scales"],
             w2_scale=tensors["w2_scales"],
             topk_weights=tensors["topk_weights"],
             topk_ids=tensors["topk_ids"],
-            quant_type_id=scalar_types.uint4b8.id,
-            global_num_experts=case.e,
-            apply_router_weight_on_input=False,
-            g_idx1=tensors["w1_g_idx"],
-            g_idx2=tensors["w2_g_idx"],
-            sort_indices1=tensors["w1_sort_indices"],
-            sort_indices2=tensors["w2_sort_indices"],
-            is_k_full=case.is_k_full,
+            quant_type_id=tensors["quant_type_id"],
+            is_k_full=tensors["is_k_full"],
         )
 
     for _ in range(warmup):
@@ -630,6 +622,7 @@ def _run_single(
     _lazy_imports()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark script.")
+    _require_moe_extension()
     _ = torch.cuda.get_device_name(0)
     results = []
     for idx, case in enumerate(cases):
@@ -865,7 +858,10 @@ def _spawn_single_run(
 ) -> None:
     env = os.environ.copy()
     old_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{root}:{old_pythonpath}" if old_pythonpath else str(root)
+    python_path = f"{root / 'python'}:{root}"
+    env["PYTHONPATH"] = (
+        f"{python_path}:{old_pythonpath}" if old_pythonpath else python_path
+    )
 
     cmd = [
         sys.executable,
