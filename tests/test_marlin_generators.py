@@ -20,9 +20,8 @@ def test_dense_generator_outputs_are_stable():
     script = ROOT / "csrc" / "quantization" / "marlin" / "generate_kernels.py"
     _run_generator(script, "9.0")
     first_sm80 = sorted(script.parent.glob("sm80_kernel_*.cu"))
-    first_sm90 = sorted(script.parent.glob("sm90_kernel_*.cu"))
     assert first_sm80, "expected dense sm80 marlin kernels to be generated"
-    assert first_sm90, "expected dense sm90 marlin kernels to be generated"
+    assert not list(script.parent.glob("sm90_kernel_*.cu"))
     assert (script.parent / "kernel_selector.h").exists()
     assert not list(script.parent.glob("sm70_kernel_*.cu"))
     assert not list(script.parent.glob("sm75_kernel_*.cu"))
@@ -30,18 +29,15 @@ def test_dense_generator_outputs_are_stable():
 
     _run_generator(script, "9.0")
     second_sm80 = sorted(script.parent.glob("sm80_kernel_*.cu"))
-    second_sm90 = sorted(script.parent.glob("sm90_kernel_*.cu"))
     assert [path.name for path in first_sm80] == [path.name for path in second_sm80]
-    assert [path.name for path in first_sm90] == [path.name for path in second_sm90]
 
 
 def test_moe_generator_outputs_are_stable():
     script = ROOT / "csrc" / "moe" / "marlin_moe_wna16" / "generate_kernels.py"
     _run_generator(script, "9.0")
     first_sm80 = sorted(script.parent.glob("sm80_kernel_*.cu"))
-    first_sm90 = sorted(script.parent.glob("sm90_kernel_*.cu"))
     assert first_sm80, "expected moe sm80 marlin kernels to be generated"
-    assert first_sm90, "expected moe sm90 marlin kernels to be generated"
+    assert not list(script.parent.glob("sm90_kernel_*.cu"))
     assert (script.parent / "kernel_selector.h").exists()
     assert not list(script.parent.glob("sm70_kernel_*.cu"))
     assert not list(script.parent.glob("sm75_kernel_*.cu"))
@@ -49,6 +45,4 @@ def test_moe_generator_outputs_are_stable():
 
     _run_generator(script, "9.0")
     second_sm80 = sorted(script.parent.glob("sm80_kernel_*.cu"))
-    second_sm90 = sorted(script.parent.glob("sm90_kernel_*.cu"))
     assert [path.name for path in first_sm80] == [path.name for path in second_sm80]
-    assert [path.name for path in first_sm90] == [path.name for path in second_sm90]

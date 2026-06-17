@@ -108,8 +108,10 @@ marlin_generate_kernels(
   marlin_generation.log
   "marlin_v100 dense kernel generation failed")
 
-file(GLOB MARLIN_TEMPLATE_SM80_KERNEL_SRC "csrc/quantization/marlin/sm80_kernel_*.cu")
-file(GLOB MARLIN_TEMPLATE_SM90_KERNEL_SRC "csrc/quantization/marlin/sm90_kernel_*.cu")
+file(GLOB MARLIN_TEMPLATE_SM80_KERNEL_SRC CONFIGURE_DEPENDS
+  "csrc/quantization/marlin/sm80_kernel_*.cu")
+file(GLOB MARLIN_TEMPLATE_SM90_KERNEL_SRC CONFIGURE_DEPENDS
+  "csrc/quantization/marlin/sm90_kernel_*.cu")
 set(MARLIN_TEMPLATE_KERNEL_SRC
   ${MARLIN_TEMPLATE_SM80_KERNEL_SRC}
   ${MARLIN_TEMPLATE_SM90_KERNEL_SRC})
@@ -146,8 +148,10 @@ marlin_generate_kernels(
   moe_marlin_generation.log
   "marlin_v100 moe kernel generation failed")
 
-file(GLOB MARLIN_MOE_SM80_SRC "csrc/moe/marlin_moe_wna16/sm80_kernel_*.cu")
-file(GLOB MARLIN_MOE_SM90_SRC "csrc/moe/marlin_moe_wna16/sm90_kernel_*.cu")
+file(GLOB MARLIN_MOE_SM80_SRC CONFIGURE_DEPENDS
+  "csrc/moe/marlin_moe_wna16/sm80_kernel_*.cu")
+file(GLOB MARLIN_MOE_SM90_SRC CONFIGURE_DEPENDS
+  "csrc/moe/marlin_moe_wna16/sm90_kernel_*.cu")
 set(MARLIN_MOE_KERNEL_SRC
   ${MARLIN_MOE_SM80_SRC}
   ${MARLIN_MOE_SM90_SRC})
