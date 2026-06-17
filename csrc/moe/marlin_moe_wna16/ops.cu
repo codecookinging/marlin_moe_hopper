@@ -417,7 +417,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               bool use_fp32_reduce, bool is_zp_float,
+               int num_tokens_past_padded_count) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -592,7 +593,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   use_atomic_add =
       effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
 
-  int num_tokens_past_padded_count = num_tokens_past_padded_ptr[0];
   int parallel = num_tokens_past_padded_count / moe_block_size;
   int n_tiles = prob_n / thread_n;
   int k_tiles = prob_k / thread_k;
@@ -978,7 +978,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float);
+      is_zp_float, num_tokens_past_padded_count);
 
   return c;
 }
