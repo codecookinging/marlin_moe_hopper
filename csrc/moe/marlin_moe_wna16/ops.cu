@@ -39,15 +39,44 @@ static int moe_max_blocks_per_sm(int dev) {
   return major_capability >= 9 ? 6 : 4;
 }
 
+static int moe_schedule_lock_slots(int global_mn_tiles, int k_tiles, int grid,
+                                   int group_blocks, int thread_k_blocks,
+                                   bool has_act_order) {
+  marlin_schedule::MarlinStreamKSchedule sk =
+      marlin_schedule::compute_marlin_streamk_schedule(
+          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
+          has_act_order);
+  // locks_off is blockIdx.x when part2 spans the full grid; otherwise it
+  // advances with part2 slice columns and can reach part2_mn_tiles.
+  return std::max(grid, sk.part2_mn_tiles + 1);
+}
+
 static int moe_min_workspace_size(int sorted_token_ids_len, int moe_block_size,
-                                  int size_n, int sms, int dev) {
+                                  int size_n, int size_k, int sms, int dev,
+                                  int num_tokens_past_padded, int thread_k,
+                                  int blocks_per_sm, bool has_act_order,
+                                  int group_blocks) {
   int parallel = sorted_token_ids_len / moe_block_size;
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int legacy = std::min(max_n_tiles * parallel, sms * 4);
-  // Stream-K++ lock indices scale with the launched grid (sms * blocks_per_sm),
-  // which can exceed sms * 4 on SM90; size workspace for the full grid.
-  int streamk_locks = sms * moe_max_blocks_per_sm(dev);
-  return std::max(legacy, streamk_locks);
+  int launch_blocks_per_sm =
+      blocks_per_sm > 0 ? static_cast<int>(blocks_per_sm)
+                        : moe_max_blocks_per_sm(dev);
+  int grid = sms * launch_blocks_per_sm;
+  int streamk_locks = grid;
+
+  int actual_parallel = num_tokens_past_padded / moe_block_size;
+  int global_mn_tiles = actual_parallel * max_n_tiles;
+  int effective_thread_k =
+      thread_k > 0 ? static_cast<int>(thread_k)
+                   : MARLIN_NAMESPACE_NAME::min_thread_k;
+  int k_tiles = size_k / effective_thread_k;
+  int thread_k_blocks = effective_thread_k / 16;
+  int schedule_locks = moe_schedule_lock_slots(
+      global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
+      has_act_order);
+
+  return std::max({legacy, streamk_locks, schedule_locks});
 }
 
 static bool effective_use_atomic_add_host(int dev, bool is_a_8bit,
@@ -914,8 +943,16 @@ torch::Tensor moe_wna16_marlin_gemm(
               "size_n = ", size_n, ", is not divisible by min_thread_n = ",
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
+  int group_blocks = 0;
+  if (!has_act_order) {
+    group_blocks = group_size == -1 ? -1 : (group_size / 16);
+  }
+  int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
+
   int min_workspace_size = moe_min_workspace_size(
-      sorted_token_ids.size(0), moe_block_size, size_n, sms, dev);
+      sorted_token_ids.size(0), moe_block_size, size_n, size_k, sms, dev,
+      num_tokens_past_padded_count, thread_k, blocks_per_sm, has_act_order,
+      group_blocks);
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);

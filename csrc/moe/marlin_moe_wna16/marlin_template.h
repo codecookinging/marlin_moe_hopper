@@ -257,7 +257,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool is_zp_float   // is zero point of float16 type?
           >
 __global__ void __launch_bounds__(
-    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::max_blocks_per_sm)
+    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::min_blocks_per_sm)
     Marlin(
     const int4* __restrict__ A,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn

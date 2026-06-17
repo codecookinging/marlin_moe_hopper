@@ -13,11 +13,16 @@
 
 template <const int threads, const int thread_m_blocks>
 struct MarlinMoeLaunchBounds {
+  // Second __launch_bounds__ argument is min blocks/SM for register allocation.
+  // Keep in sync with determine_exec_config() in ops.cu.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  static constexpr int max_blocks_per_sm =
-      thread_m_blocks > 1 ? 2 : (threads >= 256 ? 2 : 3);
+  static constexpr int min_blocks_per_sm =
+      thread_m_blocks > 1 ? 3 : (threads >= 256 ? 6 : 5);
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  static constexpr int min_blocks_per_sm =
+      thread_m_blocks > 1 ? 2 : 4;
 #else
-  static constexpr int max_blocks_per_sm = 1;
+  static constexpr int min_blocks_per_sm = 1;
 #endif
 };
 
@@ -58,7 +63,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
           const bool is_zp_float   // is zero point of float16 type?
           >
 __global__ void __launch_bounds__(
-    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::max_blocks_per_sm)
+    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::min_blocks_per_sm)
     Marlin(MARLIN_KERNEL_PARAMS);
 
 }
