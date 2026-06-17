@@ -29,6 +29,14 @@ BLOOM_HASHES = 3
 
 POLICY_THRESHOLDS = (0, 1, 3, 4, 5, 6, 7)
 
+BLOOM_SEED_BASE = 0xF1EA5EED
+BLOOM_SEED_STRIDE = 0x85EBCA77
+
+
+def bloom_seed(policy: int) -> int:
+    """Match C++ uint32_t seed arithmetic (wrap on overflow)."""
+    return (BLOOM_SEED_BASE + policy * BLOOM_SEED_STRIDE) & 0xFFFFFFFF
+
 
 def div_ceil(a: int, b: int) -> int:
     return (a + b - 1) // b if b > 0 else 0
@@ -162,7 +170,7 @@ def build_bloom_filters(policy_keys: dict[int, set[int]]) -> list[bytearray]:
     filters: list[bytearray] = []
     for policy in range(NUM_POLICIES):
         bits = bytearray(BLOOM_BITS // 8)
-        seed = 0xF1EA5EED + policy * 0x85EBCA77
+        seed = bloom_seed(policy)
         for key in policy_keys[policy]:
             bloom_insert(bits, key, seed)
         filters.append(bits)
@@ -208,7 +216,7 @@ def emit_files(output_dir: Path) -> None:
         + ",\n".join(f"  kStreamKBloom{p}" for p in range(NUM_POLICIES))
         + ",\n};\n\n"
         "static const uint32_t kStreamKBloomSeeds[kStreamKBloomPolicyCount] = {\n"
-        + ",\n".join(f"  0x{0xF1EA5EED + p * 0x85EBCA77:08x}u" for p in range(NUM_POLICIES))
+        + ",\n".join(f"  0x{bloom_seed(p):08x}u" for p in range(NUM_POLICIES))
         + ",\n};\n",
         encoding="utf-8",
     )

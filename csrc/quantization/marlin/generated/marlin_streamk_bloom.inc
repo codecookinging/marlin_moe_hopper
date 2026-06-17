@@ -63,10 +63,10 @@ static const uint8_t* const kStreamKBloomFilters[kStreamKBloomPolicyCount] = {
 
 static const uint32_t kStreamKBloomSeeds[kStreamKBloomPolicyCount] = {
   0xf1ea5eedu,
-  0x177d62964u,
-  0x1fdc1f3dbu,
-  0x283adbe52u,
-  0x3099988c9u,
-  0x38f855340u,
-  0x415711db7u,
+  0x77d62964u,
+  0xfdc1f3dbu,
+  0x83adbe52u,
+  0x099988c9u,
+  0x8f855340u,
+  0x15711db7u,
 };
