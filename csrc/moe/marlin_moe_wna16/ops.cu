@@ -1,3 +1,5 @@
+#include <cstdlib>
+#include <cstdio>
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
@@ -26,6 +28,133 @@
 #include "kernel.h"
 #include "quantization/marlin/marlin_streamk_schedule.h"
 #include "core/registration.h"
+
+
+namespace {
+
+// Cost model to evaluate the theoretical execution time of a given grid size.
+// Accounts for compute time, SM occupancy, tail quantization, and Split-K reduction overhead.
+static float runtime_units(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
+  marlin_schedule::MarlinStreamKSchedule sk =
+      marlin_schedule::compute_marlin_streamk_schedule(
+          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
+          has_act_order);
+          
+  int part1_iters = sk.part1_mn_iters;
+  int part2 = sk.part2_mn_tiles;
+  int slice_iters = sk.slice_iters;
+  
+  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
+  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
+  
+  int resident = std::min(grid, sms * bmax);
+  int hw_waves = (grid + resident - 1) / resident;
+  float busy = per_cta_iters * hw_waves;
+  
+  float idle_penalty = 0.0f;
+  if (grid < sms) {
+      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
+  }
+  
+  float red_penalty = 0.0f;
+  if (sk_active) {
+      float splits_per_tile = (float)grid / std::max(1, part2);
+      // Increase reduction penalty. Real-world testing shows that global atomic
+      // reductions (especially FP32/FP16 mixed) are much more expensive than the
+      // original model estimated, causing performance regressions at M=256.
+      red_penalty = (6.0f + 1.5f * splits_per_tile) * 10.0f;
+  }
+  
+  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
+  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
+  
+  int last_wave = grid - (hw_waves - 1) * resident;
+  float waveq_penalty = 0.0f;
+  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
+      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
+  }
+  
+  return busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
+}
+
+// Dynamically searches for the optimal grid size that minimizes the cost model.
+
+static void print_grid_stats(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order, int prob_m, int prob_n, int prob_k) {
+  marlin_schedule::MarlinStreamKSchedule sk =
+      marlin_schedule::compute_marlin_streamk_schedule(
+          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
+          has_act_order);
+          
+  int part1_iters = sk.part1_mn_iters;
+  int part2 = sk.part2_mn_tiles;
+  int slice_iters = sk.slice_iters;
+  
+  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
+  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
+  
+  int resident = std::min(grid, sms * bmax);
+  int hw_waves = (grid + resident - 1) / resident;
+  float busy = per_cta_iters * hw_waves;
+  
+  float idle_penalty = 0.0f;
+  if (grid < sms) {
+      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
+  }
+  
+  float red_penalty = 0.0f;
+  if (sk_active) {
+      float splits_per_tile = (float)grid / std::max(1, part2);
+      // Increase reduction penalty. Real-world testing shows that global atomic
+      // reductions (especially FP32/FP16 mixed) are much more expensive than the
+      // original model estimated, causing performance regressions at M=256.
+      red_penalty = (6.0f + 1.5f * splits_per_tile) * 10.0f;
+  }
+  
+  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
+  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
+  
+  int last_wave = grid - (hw_waves - 1) * resident;
+  float waveq_penalty = 0.0f;
+  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
+      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
+  }
+  
+  float total_cost = busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
+  
+  printf("[Marlin MoE Grid] M=%d N=%d K=%d | T=%d Kt=%d | Grid=%d (Bmax=%d) | Cost=%.1f [Busy=%.1f SmemFac=%.2f IdlePen=%.1f RedPen=%.1f WaveQPen=%.1f] | sk_p1=%d sk_p2=%d sk_sl=%d\n",
+         prob_m, prob_n, prob_k, global_mn_tiles, k_tiles, grid, bmax, total_cost, busy, smem_factor, idle_penalty, red_penalty, waveq_penalty, part1_iters, part2, slice_iters);
+}
+
+static int best_grid(int T, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
+    int best_g = -1;
+    float best_cost = 1e9f;
+    
+    auto eval_cand = [&](int g) {
+        if (g < 1) return;
+        float cost = runtime_units(T, g, k_tiles, sms, bmax, group_blocks, thread_k_blocks, has_act_order);
+        if (cost < best_cost - 1e-5f) {
+            best_cost = cost;
+            best_g = g;
+        } else if (std::abs(cost - best_cost) <= 1e-5f && (best_g == -1 || g < best_g)) {
+            best_g = g;
+        }
+    };
+
+    // Evaluate multiples of SMs up to max occupancy
+    for (int b = 1; b <= bmax; ++b) eval_cand(sms * b);
+    eval_cand(T);
+    eval_cand(std::max(sms, T));
+    
+    // Evaluate grids that perfectly divide the tiles
+    for (int waves = 1; waves <= 4 * bmax; ++waves) {
+        int g = (T + waves - 1) / waves;
+        if (g >= sms && g <= sms * bmax) eval_cand(g);
+    }
+    
+    return best_g;
+}
+
+} // namespace
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -571,12 +700,78 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
-  if (exec_cfg.blocks_per_sm > 1)
-    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
+  // ------------------------------------------------------------------
+  // Grid selection for DP + two-tile Split-K.
+  //
+  // Let T  = global_mn_tiles  (independent output tiles to compute)
+  //     Kt = k_tiles          (reduction-dim steps per tile)
+  //     Bmax = exec_cfg.blocks_per_sm (occupancy ceiling for this tile)
+  //
+  // compute_marlin_streamk_schedule() turns `blocks` into a plan of
+  // data-parallel waves plus a two-tile Split-K tail. Choosing `blocks`
+  // well is what makes that plan optimal. Three regimes, by how T compares
+  // to the machine width:
+  //
+  //   A. T >= sms*Bmax  -> machine is saturated by DP work. Launch the
+  //      occupancy ceiling; the scheduler runs full DP waves and absorbs
+  //      the remainder in a small two-tile SK tail.    blocks = sms*Bmax
+  //
+  //   B. sms <= T < sms*Bmax -> one CTA per output tile: pure data
+  //      parallel, ZERO split-K reduction. For this medium-M band a fixed
+  //      sms*Bmax grid only adds a global reduce (and extra co-resident
+  //      CTAs that shrink the smem pipeline) without shortening the
+  //      critical path enough to pay for it.            blocks = T
+  //
+  //   C. T < sms -> too few tiles to fill the SMs, so K MUST be split.
+  //      Use the minimal even split depth d = ceil(sms/T) (capped by Bmax
+  //      and by keeping >= kMinSkSlice k-tiles per slice) so every SM is
+  //      busy while each output tile is shared by as few CTAs as possible
+  //      (each extra sharer costs one more partial in the reduction).
+  //                                                      blocks = T*d
+  //
+  // For the target shape (N=256 -> n_tiles=2, K=6144 -> k_tiles up to 96)
+  // this keeps split-K confined to the small-M tail where it actually
+  // fills the machine, and leaves medium/large M on pure DP.
+  constexpr int kMinSkSlice = 8;  // floor on k-tiles per Split-K slice
+  int sel_n_tiles = prob_n / thread_n;
+  int sel_k_tiles = prob_k / thread_k;
+  int max_blocks = sms * exec_cfg.blocks_per_sm;
+  int sel_mn_tiles = parallel_moe_blocks * sel_n_tiles;
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
+
+  // Empirical lookup table for optimal grid sizes
+  // Format: {prob_m, optimal_grid_size}
+  // This table is populated by running the search_best_grid.py script.
+  int blocks = -1;
+  if (prob_m == 256) {
+      // TODO: Replace with the optimal grid size found by search_best_grid.py
+      // blocks = <OPTIMAL_GRID_FOR_256>;
+  }
+  
+  if (blocks == -1) {
+      // Fallback to dynamically searching for the optimal grid size using the cost model.
+      blocks = best_grid(sel_mn_tiles, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order);
+  }
+
+  // Allow overriding the grid size for empirical benchmarking
+  const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
+  if (force_grid_env) {
+      blocks = std::atoi(force_grid_env);
+  }
+
+  const char* debug_grid_env = std::getenv("MARLIN_MOE_DEBUG_GRID");
+  if (debug_grid_env != nullptr && debug_grid_env[0] == '1') {
+      print_grid_stats(sel_mn_tiles, blocks, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order, prob_m, prob_n, prob_k);
+  }
+
+  // Size the shared-memory budget to the CTAs that actually co-reside per SM,
+  // not the theoretical occupancy ceiling. When the chosen grid runs fewer
+  // blocks per SM this frees shared memory back to the pipeline.
+  int eff_blocks_per_sm = std::max(div_ceil(blocks, sms), 1);
+  if (eff_blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
