@@ -571,9 +571,64 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
-  if (exec_cfg.blocks_per_sm > 1)
-    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+
+  // ------------------------------------------------------------------
+  // Grid selection for DP + two-tile Split-K.
+  //
+  // Let T  = global_mn_tiles  (independent output tiles to compute)
+  //     Kt = k_tiles          (reduction-dim steps per tile)
+  //     Bmax = exec_cfg.blocks_per_sm (occupancy ceiling for this tile)
+  //
+  // compute_marlin_streamk_schedule() turns `blocks` into a plan of
+  // data-parallel waves plus a two-tile Split-K tail. Choosing `blocks`
+  // well is what makes that plan optimal. Three regimes, by how T compares
+  // to the machine width:
+  //
+  //   A. T >= sms*Bmax  -> machine is saturated by DP work. Launch the
+  //      occupancy ceiling; the scheduler runs full DP waves and absorbs
+  //      the remainder in a small two-tile SK tail.    blocks = sms*Bmax
+  //
+  //   B. sms <= T < sms*Bmax -> one CTA per output tile: pure data
+  //      parallel, ZERO split-K reduction. For this medium-M band a fixed
+  //      sms*Bmax grid only adds a global reduce (and extra co-resident
+  //      CTAs that shrink the smem pipeline) without shortening the
+  //      critical path enough to pay for it.            blocks = T
+  //
+  //   C. T < sms -> too few tiles to fill the SMs, so K MUST be split.
+  //      Use the minimal even split depth d = ceil(sms/T) (capped by Bmax
+  //      and by keeping >= kMinSkSlice k-tiles per slice) so every SM is
+  //      busy while each output tile is shared by as few CTAs as possible
+  //      (each extra sharer costs one more partial in the reduction).
+  //                                                      blocks = T*d
+  //
+  // For the target shape (N=256 -> n_tiles=2, K=6144 -> k_tiles up to 96)
+  // this keeps split-K confined to the small-M tail where it actually
+  // fills the machine, and leaves medium/large M on pure DP.
+  constexpr int kMinSkSlice = 8;  // floor on k-tiles per Split-K slice
+  int sel_n_tiles = prob_n / thread_n;
+  int sel_k_tiles = prob_k / thread_k;
+  int max_blocks = sms * exec_cfg.blocks_per_sm;
+  int sel_mn_tiles = parallel_moe_blocks * sel_n_tiles;
+  int blocks;
+  if (sel_mn_tiles >= max_blocks) {
+    blocks = max_blocks;  // Regime A: saturated, DP waves + SK tail.
+  } else if (sel_mn_tiles >= sms) {
+    blocks = sel_mn_tiles;  // Regime B: one CTA per tile, pure DP.
+  } else {
+    // Regime C: split K to fill the machine, minimal even depth.
+    int depth = div_ceil(sms, sel_mn_tiles);
+    depth = min(depth, exec_cfg.blocks_per_sm);
+    int slice_cap = max(1, sel_k_tiles / kMinSkSlice);
+    depth = max(1, min(depth, slice_cap));
+    blocks = min(max(sel_mn_tiles * depth, sms), max_blocks);
+  }
+
+  // Size the shared-memory budget to the CTAs that actually co-reside per SM,
+  // not the theoretical occupancy ceiling. When the chosen grid runs fewer
+  // blocks per SM this frees shared memory back to the pipeline.
+  int eff_blocks_per_sm = max(div_ceil(blocks, sms), 1);
+  if (eff_blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
 
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
