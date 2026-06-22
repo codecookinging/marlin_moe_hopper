@@ -86,6 +86,7 @@ def fused_marlin_moe(
     w1_zeros: torch.Tensor | None = None,
     w2_zeros: torch.Tensor | None = None,
     is_k_full: bool = True,
+    use_tma: bool = False,
 ) -> torch.Tensor:
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -155,6 +156,7 @@ def fused_marlin_moe(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
+<<<<<<< HEAD
     
     if not do_split:
         intermediate = ops.moe_wna16_marlin_gemm(
@@ -203,11 +205,46 @@ def fused_marlin_moe(
                 16, topk, False, quant_type_id, m, intermediate_size, k,
                 is_k_full, False, True, False, -1, -1, -1
             )
+=======
+    intermediate = ops.moe_wna16_marlin_gemm(
+        hidden_states,
+        intermediate,
+        w1,
+        bias1,
+        w1_scale,
+        None,
+        global_scale1,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        topk,
+        False,
+        quant_type_id,
+        m,
+        intermediate_size,
+        k,
+        is_k_full,
+        False,
+        True,
+        False,
+        -1,
+        -1,
+        -1,
+        use_tma,
+    )
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
     gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
     output = torch.empty(
         (m * topk, output_size), dtype=hidden_states.dtype, device=hidden_states.device
     )
+<<<<<<< HEAD
     
     if not do_split:
         output = ops.moe_wna16_marlin_gemm(
@@ -256,4 +293,38 @@ def fused_marlin_moe(
                 16, 1, True, quant_type_id, m * topk, output_size, n,
                 is_k_full, False, True, False, -1, -1, -1
             )
+=======
+    output = ops.moe_wna16_marlin_gemm(
+        activated,
+        output,
+        w2,
+        bias2,
+        w2_scale,
+        None,
+        global_scale2,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        1,
+        True,
+        quant_type_id,
+        m * topk,
+        output_size,
+        n,
+        is_k_full,
+        False,
+        True,
+        False,
+        -1,
+        -1,
+        -1,
+        use_tma,
+    )
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
     return output.view(m, topk, output_size).sum(dim=1)

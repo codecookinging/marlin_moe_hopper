@@ -1,5 +1,10 @@
+<<<<<<< HEAD
 #include <cstdlib>
 #include <cstdio>
+=======
+#include <cmath>
+#include <cstdlib>
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
@@ -26,7 +31,83 @@
 #endif
 
 #include "kernel.h"
+<<<<<<< HEAD
+=======
+#include "marlin_sm90_tma_wgmma.cuh"
+#include "quantization/marlin/marlin_streamk_schedule.h"
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 #include "core/registration.h"
+
+
+namespace {
+
+static float runtime_units(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
+  marlin_schedule::MarlinStreamKSchedule sk =
+      marlin_schedule::compute_marlin_streamk_schedule(
+          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
+          has_act_order);
+
+  int part1_iters = sk.part1_mn_iters;
+  int part2 = sk.part2_mn_tiles;
+  int slice_iters = sk.slice_iters;
+
+  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
+  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
+
+  int resident = std::min(grid, sms * bmax);
+  int hw_waves = (grid + resident - 1) / resident;
+  float busy = per_cta_iters * hw_waves;
+
+  float idle_penalty = 0.0f;
+  if (grid < sms) {
+      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
+  }
+
+  float red_penalty = 0.0f;
+  if (sk_active) {
+      float splits_per_tile = (float)grid / std::max(1, part2);
+      red_penalty = 6.0f + 1.5f * splits_per_tile;
+  }
+
+  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
+  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
+
+  int last_wave = grid - (hw_waves - 1) * resident;
+  float waveq_penalty = 0.0f;
+  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
+      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
+  }
+
+  return busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
+}
+
+static int best_grid(int T, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
+    int best_g = -1;
+    float best_cost = 1e9f;
+
+    auto eval_cand = [&](int g) {
+        if (g < 1) return;
+        float cost = runtime_units(T, g, k_tiles, sms, bmax, group_blocks, thread_k_blocks, has_act_order);
+        if (cost < best_cost - 1e-5f) {
+            best_cost = cost;
+            best_g = g;
+        } else if (std::abs(cost - best_cost) <= 1e-5f && (best_g == -1 || g < best_g)) {
+            best_g = g;
+        }
+    };
+
+    for (int b = 1; b <= bmax; ++b) eval_cand(sms * b);
+    eval_cand(T);
+    eval_cand(std::max(sms, T));
+    for (int waves = 1; waves <= 4 * bmax; ++waves) {
+        int g = (T + waves - 1) / waves;
+        if (g >= sms && g <= sms * bmax) eval_cand(g);
+    }
+
+    return best_g;
+}
+
+} // namespace
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
@@ -350,7 +431,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
+<<<<<<< HEAD
                bool use_fp32_reduce, bool is_zp_float) {
+=======
+               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks, bool use_tma) {
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -442,6 +527,153 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
+<<<<<<< HEAD
+=======
+
+  const char* use_tma_wgmma_env = std::getenv("MARLIN_MOE_USE_TMA_WGMMA");
+  if (use_tma_wgmma_env != nullptr && use_tma_wgmma_env[0] == '1') {
+    auto tma_wgmma = marlin_sm90_tma_wgmma::select_host_path(
+        major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
+        prob_n, prob_k, has_act_order, has_zp);
+    TORCH_CHECK(tma_wgmma.supported,
+                "SM90 TMA/WGMMA path is not available: ", tma_wgmma.reason);
+    auto tile = marlin_sm90_tma_wgmma::target_tile_shape(moe_block_size);
+    auto smem_check = marlin_sm90_tma_wgmma::check_shared_memory(
+        tile, b_type.size_bits(), max_shared_mem);
+    TORCH_CHECK(smem_check.supported,
+                "SM90 TMA/WGMMA path is not available: ", smem_check.reason,
+                " required_smem = ",
+                marlin_sm90_tma_wgmma::required_shared_memory_bytes(
+                    moe_block_size, b_type.size_bits()),
+                ", max_shared_mem = ", max_shared_mem);
+    auto tensor_map_abi = marlin_sm90_tma_wgmma::check_tensor_map_abi();
+    TORCH_CHECK(tensor_map_abi.supported,
+                "SM90 TMA/WGMMA path is not available: ",
+                tensor_map_abi.reason);
+    CUtensorMap tma_map_host;
+    uint64_t globalDim[2] = {
+        static_cast<uint64_t>(prob_n * b_type.size_bits() / 32),
+        static_cast<uint64_t>(num_experts * prob_k)
+    };
+    uint64_t globalStrides[1] = { globalDim[0] * sizeof(uint32_t) };
+    uint32_t boxDim[2] = {
+        static_cast<uint32_t>(128 * b_type.size_bits() / 32),
+        static_cast<uint32_t>(64)
+    };
+    uint32_t elementStrides[2] = {1, 1};
+
+    CUresult res = cuTensorMapEncodeTiled(
+        &tma_map_host,
+        CU_TENSOR_MAP_DATA_TYPE_UINT32,
+        2,
+        const_cast<void*>(B),
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_128B,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed with error code ", res);
+
+    void* tma_map_dev = nullptr;
+    cudaMallocAsync(&tma_map_dev, sizeof(CUtensorMap), stream);
+    cudaMemcpyAsync(tma_map_dev, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice, stream);
+
+    // Dimension 3: TMA Multicast (Conceptual Setup)
+    // If we wanted to launch with Cluster Multicast, we would set up the launch attribute:
+    // cudaLaunchConfig_t config = {0};
+    // config.gridDim = dim3(total_tiles);
+    // config.blockDim = dim3(128);
+    // config.dynamicSmemBytes = smem_size;
+    // config.stream = stream;
+    // cudaLaunchAttribute attribute[1];
+    // attribute[0].id = cudaLaunchAttributeClusterDimension;
+    // attribute[0].val.clusterDim.x = 2; // Cluster size 2
+    // attribute[0].val.clusterDim.y = 1;
+    // attribute[0].val.clusterDim.z = 1;
+    // config.attrs = attribute;
+    // config.numAttrs = 1;
+    // cudaLaunchKernelEx(&config, kernel, params);
+
+    marlin_sm90_tma_wgmma::Params params;
+    params.A = reinterpret_cast<const int4*>(A);
+    params.B = reinterpret_cast<const int4*>(B);
+    params.B_tma_map = tma_map_dev;
+    params.C = reinterpret_cast<int4*>(C);
+    params.C_tmp = reinterpret_cast<int4*>(C_tmp);
+    params.scales = reinterpret_cast<const int4*>(b_s);
+    params.sorted_token_ids = reinterpret_cast<const int32_t*>(sorted_token_ids);
+    params.expert_ids = reinterpret_cast<const int32_t*>(expert_ids);
+    params.num_tokens_past_padded = reinterpret_cast<const int32_t*>(num_tokens_past_padded);
+    params.topk_weights = reinterpret_cast<const float*>(topk_weights);
+    params.locks = reinterpret_cast<int*>(workspace);
+    params.prob_m = prob_m;
+    params.prob_n = prob_n;
+    params.prob_k = prob_k;
+    params.top_k = top_k;
+    params.moe_block_size = moe_block_size;
+    params.num_groups = num_groups;
+    params.group_size = group_size;
+    params.sk_slice_count = 1;
+    params.sk_slice_idx = 0;
+    params.mul_topk_weights = mul_topk_weights;
+    params.use_fp32_reduce = use_fp32_reduce;
+    params.use_tma_load = true;
+
+    int smem_size = marlin_sm90_tma_wgmma::required_shared_memory_bytes(moe_block_size, b_type.size_bits());
+    int max_parallel = prob_m * top_k / moe_block_size;
+    int total_tiles = marlin_sm90_tma_wgmma::logical_mn_tiles(max_parallel, prob_n);
+    
+    if (b_type.size_bits() == 4) {
+      if (moe_block_size == 16) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else if (moe_block_size == 32) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else if (moe_block_size == 64) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else {
+        TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
+      }
+    } else if (b_type.size_bits() == 8) {
+      if (moe_block_size == 16) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else if (moe_block_size == 32) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else if (moe_block_size == 64) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
+      } else {
+        TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
+      }
+    } else {
+      TORCH_CHECK(false, "Unsupported b_bits for TMA/WGMMA: ", b_type.size_bits());
+    }
+
+    cudaFreeAsync(tma_map_dev, stream);
+    return;
+  }
+
+  // Default pipeline depth: 2 on Turing, 4 on Ampere/Ada, 5 on Hopper.
+  // SM90 (H100) has ~228 KB opt-in shared memory vs ~164 KB on SM80, which
+  // fits one extra pipeline stage and hides more global-memory latency.
+  // The autotuning below will fall back to stages=4 if a stages=5 config is
+  // not found (e.g. because the combination of thread_n / thread_k is such
+  // that 5 stages still exceeds the smem budget for that tile).
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   int stages = 4;
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
@@ -497,6 +729,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
+<<<<<<< HEAD
   printf(
       "moe_block_size=%d thread_m_blocks=%d blocks_per_sm=%d sms=%d "
       "num_threads=%d thread_k=%d thread_n=%d prob_m=%d\n",
@@ -510,9 +743,24 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   }
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
-
+=======
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
+
+  int sel_n_tiles = prob_n / thread_n;
+  int sel_k_tiles = prob_k / thread_k;
+  int sel_mn_tiles = parallel_moe_blocks * sel_n_tiles;
+
+  // Dynamically search for the optimal grid size using the cost model
+  int blocks = best_grid(sel_mn_tiles, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order);
+
+  // Size the shared-memory budget to the CTAs that actually co-reside per SM,
+  // not the theoretical occupancy ceiling. When the chosen grid runs fewer
+  // blocks per SM this frees shared memory back to the pipeline.
+  int eff_blocks_per_sm = std::max(div_ceil(blocks, sms), 1);
+  if (eff_blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
@@ -577,7 +825,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm, bool use_tma) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -894,7 +1142,11 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
+<<<<<<< HEAD
       is_zp_float);
+=======
+      is_zp_float, parallel_moe_blocks, use_tma);
+>>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
   return c;
 }

@@ -69,10 +69,11 @@ function(marlin_configure_cuda_sources)
   endif()
 endfunction()
 
-set(CUDA_ARCHS "9.0")
-set(VLLM_GPU_ARCHES "90")
-set(CUDA_ARCHS_STR "9.0")
-message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS}")
+# Hopper WGMMA/TMA PTX (wgmma.*, cp.async.bulk.tensor) requires sm_90a, not sm_90.
+set(CUDA_ARCHS "9.0a")
+set(VLLM_GPU_ARCHES "90a")
+set(CUDA_ARCHS_STR "9.0a")
+message(STATUS "marlin_v100 CUDA target architectures: ${CUDA_ARCHS} (sm_90a for WGMMA)")
 message(STATUS "marlin_v100 CMake CUDA architectures: ${VLLM_GPU_ARCHES}")
 
 get_torch_gpu_compiler_flags(VLLM_GPU_FLAGS ${VLLM_GPU_LANG})

@@ -13,7 +13,9 @@ SUPPORT_FP8 = False
 SUPPORT_SM75 = False
 SUPPORT_SM80 = False
 SUPPORT_SM90 = False
-for arch in sys.argv[1].split(","):
+for arch_token in sys.argv[1].split(","):
+    # Accept "9.0a" style feature-suffixed arch strings from CMake.
+    arch = arch_token.strip().rstrip("aA")
     arch = arch[: arch.index(".") + 2].replace(".", "")
     arch = int(arch)
     # SM89 and the SM12x family (SM120 RTX 5090, SM121 DGX Spark GB10)
