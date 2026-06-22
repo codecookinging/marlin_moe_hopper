@@ -151,7 +151,7 @@ __device__ inline void sub_zp(
 
 // Same as above, but for act_order (each K is multiplied individually)
 template <vllm::ScalarTypeId type_id>
-__device__ __forceinline__ void scale4(
+__device__ inline void scale4(
     typename MarlinScalarType<type_id>::FragB& frag_b,
     typename MarlinScalarType<type_id>::FragS& frag_s_1,
     typename MarlinScalarType<type_id>::FragS& frag_s_2,
@@ -594,8 +594,7 @@ __global__ void Marlin(
       locks_off++;
     }
 
-    if (first_init && effective_use_atomic_add && slice_count > 1 &&
-        slice_idx == 0) {
+    if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(block_num_valid_tokens, threads / threads_per_m);
@@ -2104,8 +2103,7 @@ __global__ void Marlin(
       // write-out
       if constexpr (!has_act_order && group_blocks == -1 &&
                     (has_zp && dequant_skip_flop || !has_zp)) {
-        if (b_type.size_bits() == 8 || (last || effective_use_atomic_add) ||
-            is_a_8bit) {
+        if (b_type.size_bits() == 8 || (last || use_atomic_add) || is_a_8bit) {
           if (s_sh_wr_pred) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
             marlin_hopper::cp_async4_l2_128(&sh_s[s_sh_wr],
