@@ -28,77 +28,6 @@
 #include "kernel.h"
 #include "core/registration.h"
 
-
-namespace {
-
-static float runtime_units(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-          has_act_order);
-
-  int part1_iters = sk.part1_mn_iters;
-  int part2 = sk.part2_mn_tiles;
-  int slice_iters = sk.slice_iters;
-
-  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
-  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
-
-  int resident = std::min(grid, sms * bmax);
-  int hw_waves = (grid + resident - 1) / resident;
-  float busy = per_cta_iters * hw_waves;
-
-  float idle_penalty = 0.0f;
-  if (grid < sms) {
-      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
-  }
-
-  float red_penalty = 0.0f;
-  if (sk_active) {
-      float splits_per_tile = (float)grid / std::max(1, part2);
-      red_penalty = 6.0f + 1.5f * splits_per_tile;
-  }
-
-  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
-  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
-
-  int last_wave = grid - (hw_waves - 1) * resident;
-  float waveq_penalty = 0.0f;
-  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
-      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
-  }
-
-  return busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
-}
-
-static int best_grid(int T, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-    int best_g = -1;
-    float best_cost = 1e9f;
-
-    auto eval_cand = [&](int g) {
-        if (g < 1) return;
-        float cost = runtime_units(T, g, k_tiles, sms, bmax, group_blocks, thread_k_blocks, has_act_order);
-        if (cost < best_cost - 1e-5f) {
-            best_cost = cost;
-            best_g = g;
-        } else if (std::abs(cost - best_cost) <= 1e-5f && (best_g == -1 || g < best_g)) {
-            best_g = g;
-        }
-    };
-
-    for (int b = 1; b <= bmax; ++b) eval_cand(sms * b);
-    eval_cand(T);
-    eval_cand(std::max(sms, T));
-    for (int waves = 1; waves <= 4 * bmax; ++waves) {
-        int g = (T + waves - 1) / waves;
-        if (g >= sms && g <= sms * bmax) eval_cand(g);
-    }
-
-    return best_g;
-}
-
-} // namespace
-
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -510,24 +439,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
-
-  const char* use_tma_wgmma_env = std::getenv("MARLIN_MOE_USE_TMA_WGMMA");
-  if (use_tma_wgmma_env != nullptr && use_tma_wgmma_env[0] == '1') {
-    auto tma_wgmma = marlin_sm90_tma_wgmma::select_host_path(
-        major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
-        prob_n, prob_k, has_act_order, has_zp);
-    TORCH_CHECK(tma_wgmma.supported,
-                "SM90 TMA/WGMMA path is not available: ", tma_wgmma.reason);
-    TORCH_CHECK(false,
-                "SM90 TMA/WGMMA path selected but no launch target is wired.");
-  }
-
-  // Default pipeline depth: 2 on Turing, 4 on Ampere/Ada, 5 on Hopper.
-  // SM90 (H100) has ~228 KB opt-in shared memory vs ~164 KB on SM80, which
-  // fits one extra pipeline stage and hides more global-memory latency.
-  // The autotuning below will fall back to stages=4 if a stages=5 config is
-  // not found (e.g. because the combination of thread_n / thread_k is such
-  // that 5 stages still exceeds the smem budget for that tile).
   int stages = 4;
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
@@ -589,6 +500,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   }
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
+
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
