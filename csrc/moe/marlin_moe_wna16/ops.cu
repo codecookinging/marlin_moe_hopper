@@ -26,204 +26,12 @@
 #endif
 
 #include "kernel.h"
-#include "quantization/marlin/marlin_streamk_schedule.h"
 #include "core/registration.h"
-
-
-namespace {
-
-// Cost model to evaluate the theoretical execution time of a given grid size.
-// Accounts for compute time, SM occupancy, tail quantization, and Split-K reduction overhead.
-static float runtime_units(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-          has_act_order);
-          
-  int part1_iters = sk.part1_mn_iters;
-  int part2 = sk.part2_mn_tiles;
-  int slice_iters = sk.slice_iters;
-  
-  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
-  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
-  
-  int resident = std::min(grid, sms * bmax);
-  int hw_waves = (grid + resident - 1) / resident;
-  float busy = per_cta_iters * hw_waves;
-  
-  float idle_penalty = 0.0f;
-  if (grid < sms) {
-      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
-  }
-  
-  float red_penalty = 0.0f;
-  if (sk_active) {
-      float splits_per_tile = (float)grid / std::max(1, part2);
-      // Increase reduction penalty. Real-world testing shows that global atomic
-      // reductions (especially FP32/FP16 mixed) are much more expensive than the
-      // original model estimated, causing performance regressions at M=256.
-      red_penalty = (6.0f + 1.5f * splits_per_tile) * 10.0f;
-  }
-  
-  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
-  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
-  
-  int last_wave = grid - (hw_waves - 1) * resident;
-  float waveq_penalty = 0.0f;
-  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
-      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
-  }
-  
-  return busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
-}
-
-// Dynamically searches for the optimal grid size that minimizes the cost model.
-
-static void print_grid_stats(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order, int prob_m, int prob_n, int prob_k) {
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-          has_act_order);
-          
-  int part1_iters = sk.part1_mn_iters;
-  int part2 = sk.part2_mn_tiles;
-  int slice_iters = sk.slice_iters;
-  
-  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
-  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
-  
-  int resident = std::min(grid, sms * bmax);
-  int hw_waves = (grid + resident - 1) / resident;
-  float busy = per_cta_iters * hw_waves;
-  
-  float idle_penalty = 0.0f;
-  if (grid < sms) {
-      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
-  }
-  
-  float red_penalty = 0.0f;
-  if (sk_active) {
-      float splits_per_tile = (float)grid / std::max(1, part2);
-      // Increase reduction penalty. Real-world testing shows that global atomic
-      // reductions (especially FP32/FP16 mixed) are much more expensive than the
-      // original model estimated, causing performance regressions at M=256.
-      red_penalty = (6.0f + 1.5f * splits_per_tile) * 10.0f;
-  }
-  
-  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
-  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
-  
-  int last_wave = grid - (hw_waves - 1) * resident;
-  float waveq_penalty = 0.0f;
-  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
-      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
-  }
-  
-  float total_cost = busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
-  
-  printf("[Marlin MoE Grid] M=%d N=%d K=%d | T=%d Kt=%d | Grid=%d (Bmax=%d) | Cost=%.1f [Busy=%.1f SmemFac=%.2f IdlePen=%.1f RedPen=%.1f WaveQPen=%.1f] | sk_p1=%d sk_p2=%d sk_sl=%d\n",
-         prob_m, prob_n, prob_k, global_mn_tiles, k_tiles, grid, bmax, total_cost, busy, smem_factor, idle_penalty, red_penalty, waveq_penalty, part1_iters, part2, slice_iters);
-}
-
-static int best_grid(int T, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-    int best_g = -1;
-    float best_cost = 1e9f;
-    
-    auto eval_cand = [&](int g) {
-        if (g < 1) return;
-        float cost = runtime_units(T, g, k_tiles, sms, bmax, group_blocks, thread_k_blocks, has_act_order);
-        if (cost < best_cost - 1e-5f) {
-            best_cost = cost;
-            best_g = g;
-        } else if (std::abs(cost - best_cost) <= 1e-5f && (best_g == -1 || g < best_g)) {
-            best_g = g;
-        }
-    };
-
-    // Evaluate multiples of SMs up to max occupancy
-    for (int b = 1; b <= bmax; ++b) eval_cand(sms * b);
-    eval_cand(T);
-    eval_cand(std::max(sms, T));
-    
-    // Evaluate grids that perfectly divide the tiles
-    for (int waves = 1; waves <= 4 * bmax; ++waves) {
-        int g = (T + waves - 1) / waves;
-        if (g >= sms && g <= sms * bmax) eval_cand(g);
-    }
-    
-    return best_g;
-}
-
-} // namespace
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
                 "only float16 and bfloat16 is supported");
-
-static int moe_max_blocks_per_sm(int dev) {
-  int major_capability = 0;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
-  return major_capability >= 9 ? 6 : 4;
-}
-
-static int moe_schedule_lock_slots(int global_mn_tiles, int k_tiles, int grid,
-                                   int group_blocks, int thread_k_blocks,
-                                   bool has_act_order) {
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-          has_act_order);
-  // When part2 spans the full grid, locks_off is blockIdx.x (max grid - 1).
-  if (sk.part2_mn_tiles >= grid) {
-    return grid;
-  }
-  // Otherwise locks_off advances with part2 slice columns.
-  return std::max(grid, sk.part2_mn_tiles + 1);
-}
-
-static int moe_min_workspace_size(int sorted_token_ids_len, int moe_block_size,
-                                  int size_n, int size_k, int sms, int dev,
-                                  int num_tokens_past_padded, int thread_k,
-                                  int blocks_per_sm, bool has_act_order,
-                                  int group_blocks) {
-  int parallel = sorted_token_ids_len / moe_block_size;
-  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int legacy = std::min(max_n_tiles * parallel, sms * 4);
-  int launch_blocks_per_sm =
-      blocks_per_sm > 0 ? static_cast<int>(blocks_per_sm)
-                        : moe_max_blocks_per_sm(dev);
-  int grid = sms * launch_blocks_per_sm;
-  int streamk_locks = grid;
-
-  int actual_parallel = num_tokens_past_padded / moe_block_size;
-  int global_mn_tiles = actual_parallel * max_n_tiles;
-  int effective_thread_k =
-      thread_k > 0 ? static_cast<int>(thread_k)
-                   : MARLIN_NAMESPACE_NAME::min_thread_k;
-  int k_tiles = size_k / effective_thread_k;
-  int thread_k_blocks = effective_thread_k / 16;
-  int schedule_locks = moe_schedule_lock_slots(
-      global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-      has_act_order);
-
-  return std::max({legacy, streamk_locks, schedule_locks});
-}
-
-static bool effective_use_atomic_add_host(int dev, bool is_a_8bit,
-                                          bool use_fp32_reduce,
-                                          bool use_atomic_add) {
-#if MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
-  if (!is_a_8bit && !use_fp32_reduce) {
-    int major_capability = 0;
-    cudaDeviceGetAttribute(&major_capability,
-                           cudaDevAttrComputeCapabilityMajor, dev);
-    if (major_capability >= 9) return true;
-  }
-#endif
-  return use_atomic_add;
-}
 
 namespace MARLIN_NAMESPACE_NAME {
 
@@ -508,20 +316,10 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    int max_blocks_per_sm = 1;
-    if (is_sm90) {
-      if (thread_m_blocks == 1) {
-        max_blocks_per_sm = th_config.num_threads >= 256 ? 6 : 5;
-      } else {
-        max_blocks_per_sm = 3;
-      }
-    } else {
       if (thread_m_blocks == 1)
-        max_blocks_per_sm = 4;
+      allow_count = max(min(allow_count, 4), 1);
       else
-        max_blocks_per_sm = 2;
-    }
-    allow_count = max(min(allow_count, max_blocks_per_sm), 1);
+      allow_count = max(min(allow_count, 2), 1);
 
     if (prob_n / th_config.thread_n * prob_m * top_k * 4 < sms * allow_count) {
       allow_count =
@@ -549,7 +347,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks) {
+               bool use_fp32_reduce, bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -700,78 +498,17 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-
-  // ------------------------------------------------------------------
-  // Grid selection for DP + two-tile Split-K.
-  //
-  // Let T  = global_mn_tiles  (independent output tiles to compute)
-  //     Kt = k_tiles          (reduction-dim steps per tile)
-  //     Bmax = exec_cfg.blocks_per_sm (occupancy ceiling for this tile)
-  //
-  // compute_marlin_streamk_schedule() turns `blocks` into a plan of
-  // data-parallel waves plus a two-tile Split-K tail. Choosing `blocks`
-  // well is what makes that plan optimal. Three regimes, by how T compares
-  // to the machine width:
-  //
-  //   A. T >= sms*Bmax  -> machine is saturated by DP work. Launch the
-  //      occupancy ceiling; the scheduler runs full DP waves and absorbs
-  //      the remainder in a small two-tile SK tail.    blocks = sms*Bmax
-  //
-  //   B. sms <= T < sms*Bmax -> one CTA per output tile: pure data
-  //      parallel, ZERO split-K reduction. For this medium-M band a fixed
-  //      sms*Bmax grid only adds a global reduce (and extra co-resident
-  //      CTAs that shrink the smem pipeline) without shortening the
-  //      critical path enough to pay for it.            blocks = T
-  //
-  //   C. T < sms -> too few tiles to fill the SMs, so K MUST be split.
-  //      Use the minimal even split depth d = ceil(sms/T) (capped by Bmax
-  //      and by keeping >= kMinSkSlice k-tiles per slice) so every SM is
-  //      busy while each output tile is shared by as few CTAs as possible
-  //      (each extra sharer costs one more partial in the reduction).
-  //                                                      blocks = T*d
-  //
-  // For the target shape (N=256 -> n_tiles=2, K=6144 -> k_tiles up to 96)
-  // this keeps split-K confined to the small-M tail where it actually
-  // fills the machine, and leaves medium/large M on pure DP.
-  constexpr int kMinSkSlice = 8;  // floor on k-tiles per Split-K slice
-  int sel_n_tiles = prob_n / thread_n;
-  int sel_k_tiles = prob_k / thread_k;
-  int max_blocks = sms * exec_cfg.blocks_per_sm;
-  int sel_mn_tiles = parallel_moe_blocks * sel_n_tiles;
-  int thread_k_blocks = thread_k / 16;
-  int thread_n_blocks = thread_n / 16;
-
-  // Empirical lookup table for optimal grid sizes
-  // Format: {prob_m, optimal_grid_size}
-  // This table is populated by running the search_best_grid.py script.
-  int blocks = -1;
-  if (prob_m == 256) {
-      // TODO: Replace with the optimal grid size found by search_best_grid.py
-      // blocks = <OPTIMAL_GRID_FOR_256>;
-  }
-  
-  if (blocks == -1) {
-      // Fallback to dynamically searching for the optimal grid size using the cost model.
-      blocks = best_grid(sel_mn_tiles, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order);
-  }
-
+  int blocks = sms * exec_cfg.blocks_per_sm;
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
   if (force_grid_env) {
       blocks = std::atoi(force_grid_env);
   }
+  if (exec_cfg.blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
-  const char* debug_grid_env = std::getenv("MARLIN_MOE_DEBUG_GRID");
-  if (debug_grid_env != nullptr && debug_grid_env[0] == '1') {
-      print_grid_stats(sel_mn_tiles, blocks, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order, prob_m, prob_n, prob_k);
-  }
-
-  // Size the shared-memory budget to the CTAs that actually co-reside per SM,
-  // not the theoretical occupancy ceiling. When the chosen grid runs fewer
-  // blocks per SM this frees shared memory back to the pipeline.
-  int eff_blocks_per_sm = std::max(div_ceil(blocks, sms), 1);
-  if (eff_blocks_per_sm > 1)
-    max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
+  int thread_k_blocks = thread_k / 16;
+  int thread_n_blocks = thread_n / 16;
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
@@ -786,19 +523,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
               ", has_act_order = ", has_act_order, ", is_k_full = ", is_k_full,
               ", has_zp = ", has_zp, ", is_zp_float = ", is_zp_float,
               ", max_shared_mem = ", max_shared_mem);
-
-  use_atomic_add =
-      effective_use_atomic_add_host(dev, is_a_8bit, use_fp32_reduce, use_atomic_add);
-
-  TORCH_CHECK(parallel_moe_blocks > 0, "parallel_moe_blocks must be > 0, got ",
-              parallel_moe_blocks);
-  int n_tiles = prob_n / thread_n;
-  int k_tiles = prob_k / thread_k;
-  int global_mn_tiles = parallel_moe_blocks * n_tiles;
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, blocks, group_blocks, thread_k_blocks,
-          has_act_order);
 
   int sh_cache_size =
       get_kernel_cache_size(thread_tfg, m_block_size_8, thread_m_blocks, prob_m,
@@ -828,8 +552,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
-      sk.part2_mn_tiles, sk.part1_mn_iters, sk.slice_iters);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
 
@@ -990,17 +713,13 @@ torch::Tensor moe_wna16_marlin_gemm(
     c = torch::empty({size_m * top_k, size_n}, options);
   }
 
-  int dev = a.get_device();
-  use_atomic_add = effective_use_atomic_add_host(
-      dev, a_type.size_bits() == 8, use_fp32_reduce, use_atomic_add);
-
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
+    // max num of threadblocks is sms * 4
     long max_c_tmp_size = min(
         (long)size_n * sorted_token_ids.size(0),
-        (long)sms * moe_max_blocks_per_sm(dev) * moe_block_size *
-            MARLIN_NAMESPACE_NAME::max_thread_n);
+        (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
     c_tmp = torch::empty({max_c_tmp_size}, options_fp32);
   } else {
@@ -1141,35 +860,14 @@ torch::Tensor moe_wna16_marlin_gemm(
               "size_n = ", size_n, ", is not divisible by min_thread_n = ",
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
-  int group_blocks = 0;
-  if (!has_act_order) {
-    group_blocks = group_size == -1 ? -1 : (group_size / 16);
-  }
-
-  TORCH_CHECK(num_tokens_past_padded.defined() &&
-                  num_tokens_past_padded.numel() == 1,
-              "num_tokens_past_padded must be a scalar tensor");
-  TORCH_CHECK(num_tokens_past_padded.scalar_type() == at::ScalarType::Int,
-              "num_tokens_past_padded must be int32");
-  int num_tokens_past_padded_count =
-      num_tokens_past_padded.to(torch::kCPU).item<int>();
-  TORCH_CHECK(num_tokens_past_padded_count >= 0,
-              "num_tokens_past_padded must be non-negative, got ",
-              num_tokens_past_padded_count);
-  int parallel_moe_blocks =
-      num_tokens_past_padded_count / static_cast<int>(moe_block_size);
-  TORCH_CHECK(parallel_moe_blocks > 0,
-              "parallel_moe_blocks must be > 0, got ", parallel_moe_blocks,
-              " from num_tokens_past_padded=", num_tokens_past_padded_count,
-              ", moe_block_size=", moe_block_size);
-
-  int min_workspace_size = moe_min_workspace_size(
-      sorted_token_ids.size(0), moe_block_size, size_n, size_k, sms, dev,
-      num_tokens_past_padded_count, thread_k, blocks_per_sm, has_act_order,
-      group_blocks);
+  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+  int min_workspace_size = min(
+      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
+
+  int dev = a.get_device();
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
@@ -1192,7 +890,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, parallel_moe_blocks);
+      is_zp_float);
 
   return c;
 }

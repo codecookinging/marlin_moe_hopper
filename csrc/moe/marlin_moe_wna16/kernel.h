@@ -7,25 +7,6 @@
 #include "quantization/marlin/marlin_dtypes.cuh"
 #include "core/scalar_type.hpp"
 
-#ifndef MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE
-  #define MARLIN_MOE_SM90_AGGRESSIVE_ATOMIC_REDUCE 0
-#endif
-
-template <const int threads, const int thread_m_blocks>
-struct MarlinMoeLaunchBounds {
-  // Second __launch_bounds__ argument is min blocks/SM for register allocation.
-  // Keep in sync with determine_exec_config() in ops.cu.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  static constexpr int min_blocks_per_sm =
-      thread_m_blocks > 1 ? 3 : (threads >= 256 ? 6 : 5);
-#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  static constexpr int min_blocks_per_sm =
-      thread_m_blocks > 1 ? 2 : 4;
-#else
-  static constexpr int min_blocks_per_sm = 1;
-#endif
-};
-
 #define MARLIN_KERNEL_PARAMS                                          \
   const int4 *__restrict__ A, const int4 *__restrict__ B,             \
       int4 *__restrict__ C, int4 *__restrict__ C_tmp,                 \
@@ -40,8 +21,7 @@ struct MarlinMoeLaunchBounds {
       const float *__restrict__ topk_weights_ptr, int top_k,          \
       bool mul_topk_weights, int num_groups, int prob_m, int prob_n,  \
       int prob_k, int *locks, bool has_bias, bool use_atomic_add,     \
-      bool use_fp32_reduce, int sk_part2_mn_tiles, int sk_part1_mn_iters, \
-      int sk_slice_iters
+      bool use_fp32_reduce
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
@@ -62,8 +42,6 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
-__global__ void __launch_bounds__(
-    threads, MarlinMoeLaunchBounds<threads, thread_m_blocks>::min_blocks_per_sm)
-    Marlin(MARLIN_KERNEL_PARAMS);
+__global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }
