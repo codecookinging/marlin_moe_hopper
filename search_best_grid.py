@@ -91,7 +91,7 @@ def run_chunk(gpu_id, chunk):
                                 parsed_count += 1
             
             # Fallback to parsing stdout if JSON parsing failed (only works reliably for single case)
-            if parsed_count == 0 and len(cases_for_grid) == 1:
+            if parsed_count == 0:  #这里 后面只设置单一目标，目前多目标 提取时间
                 single_case = cases_for_grid[0]
                 for line in proc.stdout.split('\n'):
                     if single_case in line and 'bfloat16' not in line:
