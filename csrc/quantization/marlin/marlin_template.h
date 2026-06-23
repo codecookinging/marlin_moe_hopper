@@ -267,8 +267,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem,
-    int sk_part2_mn_tiles, int sk_part1_mn_iters, int sk_slice_iters) {
+    int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -372,20 +371,38 @@ __global__ void Marlin(
   // better partitioning with less reductions
   int parallel = 1;
   if (prob_m > m_block_size) {
-    parallel = prob_m / m_block_size;
+    parallel = prob_m / m_block_size; 
     prob_m = m_block_size;
   }
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
 
+  printf("[GPU %d] Marlin kernel launched with prob_m=%d, prob_n=%d, prob_k=%d, parallel=%d, k_tiles=%d, n_tiles=%d, thread_k_blocks=%d, thread_n_blocks=%d, m_block_size=%d, gridDim.x=%d\n",
+         blockIdx.x, prob_m, prob_n, prob_k, parallel, k_tiles, n_tiles,thread_k_blocks, thread_n_blocks, m_block_size, gridDim.x);
+
   int global_mn_tiles = parallel * n_tiles;
-  int part2_mn_tiles = sk_part2_mn_tiles;
-  int part1_mn_iters = sk_part1_mn_iters;
+  int part2_mn_tiles = global_mn_tiles;
+  int part1_mn_iters = 0;
   bool in_part2 = false;
 
-  // Host-side Stream-K++ schedule (marlin_streamk_schedule.h).
-  int iters = sk_slice_iters;
+  if (global_mn_tiles > gridDim.x) {
+    part2_mn_tiles = global_mn_tiles % gridDim.x;
+    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  }
+
+  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+
+  if constexpr (!has_act_order && group_blocks != -1) {
+    if (group_blocks >= thread_k_blocks) {
+      // Ensure that the number of tiles in each stripe is a multiple of the
+      // groupsize; this avoids an annoying special case where a stripe starts
+      // in the middle of group.
+      iters = (group_blocks / thread_k_blocks) *
+              div_ceil(iters, (group_blocks / thread_k_blocks));
+    }
+  }
 
   int slice_row = 0;
   int slice_col_par = blockIdx.x;
