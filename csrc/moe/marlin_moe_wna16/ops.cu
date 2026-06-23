@@ -316,6 +316,8 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
+    printf("allow_count = %d, reg_size = %d, cache_size = %d\n", allow_count,
+           reg_size, cache_size);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
@@ -493,6 +495,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
+
+  printf("blocks_per_sm = %d, sms = %d, num_threads = %d\n",
+         exec_cfg.blocks_per_sm, sms, num_threads);
+
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
   if (force_grid_env) {
