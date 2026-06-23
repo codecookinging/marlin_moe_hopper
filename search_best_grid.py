@@ -4,26 +4,29 @@ import json
 import tempfile
 import sys
 import re
+import argparse
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
-# Candidate grids to test for M=256
-# T = 256 for M=256 (assuming glm5 config: N=256, K=6144, TOPK=8)
-# We test T itself, SMS, and various multiples up to SMS * BMAX (132 * 6 = 792)
-# Add some fine-grained candidates around the theoretical optimal and boundaries
+parser = argparse.ArgumentParser(description="Search for the best grid size across GPUs.")
+parser.add_argument("--case", type=str, default="glm5_prefill_m256", help="Specific case to run (default: glm5_prefill_m256).")
+parser.add_argument("--all-cases", action="store_true", help="Run all built-in cases. If set, --case is ignored.")
+args = parser.parse_args()
+
+# Candidate grids to test
+# We test various multiples up to SMS * BMAX (132 * 6 = 792)
 candidates = list(range(8, 792, 8))
 candidates = sorted(list(set(candidates)))
 
 print("Step 1: Skipping recompilation (assuming already built)...")
-# build_cmd = f"PYTHONPATH={os.getcwd()}/python {sys.executable} setup.py build_ext --inplace"
-# try:
-#     subprocess.run(build_cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-# except subprocess.CalledProcessError:
-#     print("Warning: Build failed. Assuming it's already built or running in a CPU-only env for testing.")
 
-print(f"\nStep 2: Benchmarking {len(candidates)} candidate grids for M=256 across 8 GPUs...")
+if args.all_cases:
+    print(f"\nStep 2: Benchmarking {len(candidates)} candidate grids for ALL cases across 8 GPUs...")
+else:
+    print(f"\nStep 2: Benchmarking {len(candidates)} candidate grids for case '{args.case}' across 8 GPUs...")
 
 def run_chunk(gpu_id, chunk):
-    results = []
+    chunk_results = []
     for grid in chunk:
         env = os.environ.copy()
         env["MARLIN_MOE_FORCE_GRID"] = str(grid)
@@ -37,38 +40,54 @@ def run_chunk(gpu_id, chunk):
             sys.executable, "benchmark_marlin_moe_ab.py", 
             "--mode", "single", 
             "--timing", "batch", 
-            "--cases", "glm5_prefill_m256",
             "--output-json", tmp_json
         ]
         
+        if not args.all_cases:
+            cmd.extend(["--cases", args.case])
+        
+        grid_times = {}
         try:
             # Run the benchmark
             proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             
             # Read the JSON output
-            time_ms = None
             if os.path.exists(tmp_json) and os.path.getsize(tmp_json) > 0:
                 with open(tmp_json, 'r') as f:
                     data = json.load(f)
-                    if isinstance(data, list) and len(data) > 0:
-                        record = data[0]
-                        for key in ['time_ms', 'mean_ms', 'batch_ms', 'p50_ms', 'latency_ms', 'latency']:
-                            if key in record:
-                                time_ms = float(record[key])
-                                break
-            
-            # Fallback to parsing stdout if JSON parsing failed
-            if time_ms is None:
-                for line in proc.stdout.split('\n'):
-                    if 'glm5_prefill_m256' in line and 'ms' in line:
-                        match = re.search(r'([0-9]+\.[0-9]+)\s*ms', line)
-                        if match:
-                            time_ms = float(match.group(1))
-                            break
+                    if isinstance(data, list):
+                        for record in data:
+                            # Extract case name
+                            case_name = record.get("case", {}).get("name", "unknown_case")
                             
-            if time_ms is not None:
-                results.append((grid, time_ms))
-                print(f"[GPU {gpu_id}] Grid {grid:3d} -> {time_ms:.4f} ms")
+                            # Extract time
+                            time_ms = None
+                            for key in ['mean_us', 'p50_us', 'total_us', 'time_ms', 'mean_ms', 'batch_ms', 'latency_ms']:
+                                if key in record:
+                                    val = float(record[key])
+                                    if key.endswith('_us'):
+                                        val /= 1000.0  # Convert us to ms
+                                    time_ms = val
+                                    break
+                            
+                            if time_ms is not None:
+                                grid_times[case_name] = time_ms
+            
+            # Fallback to parsing stdout if JSON parsing failed (only works reliably for single case)
+            if not grid_times and not args.all_cases:
+                for line in proc.stdout.split('\n'):
+                    if args.case in line and 'bfloat16' not in line:
+                        numbers = re.findall(r"[\d.]+", line)
+                        grid_times[args.case] = float(numbers[-2])
+                        break
+                            
+            if grid_times:
+                chunk_results.append((grid, grid_times))
+                # Format a short summary for the console
+                cases_str = ", ".join([f"{k}: {v:.4f}ms" for k, v in grid_times.items()])
+                if len(cases_str) > 80:
+                    cases_str = cases_str[:77] + "..."
+                print(f"[GPU {gpu_id}] Grid {grid:3d} -> {cases_str}")
             else:
                 print(f"[GPU {gpu_id}] Grid {grid:3d} -> Failed to parse time.")
                 
@@ -77,7 +96,8 @@ def run_chunk(gpu_id, chunk):
         finally:
             if os.path.exists(tmp_json):
                 os.remove(tmp_json)
-    return results
+                
+    return chunk_results
 
 # Split candidates into 8 chunks
 num_gpus = 8
@@ -94,27 +114,48 @@ if not all_results:
     print("No valid results collected. Please check the benchmark script output.")
     sys.exit(1)
 
-# Sort by execution time (ascending)
-all_results.sort(key=lambda x: x[1])
+# Reorganize results by case: { case_name: [(grid1, time1), (grid2, time2), ...] }
+case_results = defaultdict(list)
+for grid, times in all_results:
+    for case_name, t in times.items():
+        case_results[case_name].append((grid, t))
 
 output_file = "grid_search_results.txt"
 with open(output_file, "w") as f:
-    f.write("+" + "-"*30 + "+\n")
-    f.write("| Grid Size | Execution Time (ms) |\n")
-    f.write("+" + "-"*30 + "+\n")
-    for grid, time_ms in all_results:
-        if grid == all_results[0][0]:
-            line = f"| {grid:9d} | {time_ms:17.4f} * |  <-- BEST\n"
-        else:
-            line = f"| {grid:9d} | {time_ms:17.4f}   |\n"
-        f.write(line)
-        print(line, end="")
-    f.write("+" + "-"*30 + "+\n")
+    for case_name, results in case_results.items():
+        # Sort by execution time (ascending)
+        results.sort(key=lambda x: x[1])
+        
+        header = f"\n=== Results for Case: {case_name} ===\n"
+        f.write(header)
+        print(header, end="")
+        
+        table_border = "+" + "-"*30 + "+\n"
+        f.write(table_border)
+        print(table_border, end="")
+        
+        row_header = "| Grid Size | Execution Time (ms) |\n"
+        f.write(row_header)
+        print(row_header, end="")
+        
+        f.write(table_border)
+        print(table_border, end="")
+        
+        for grid, time_ms in results:
+            if grid == results[0][0]:
+                line = f"| {grid:9d} | {time_ms:17.4f} * |  <-- BEST\n"
+            else:
+                line = f"| {grid:9d} | {time_ms:17.4f}   |\n"
+            f.write(line)
+            print(line, end="")
+            
+        f.write(table_border)
+        print(table_border, end="")
+        
+        best_grid = results[0][0]
+        best_time = results[0][1]
+        summary = f"Optimal Grid for {case_name} is {best_grid} ({best_time:.4f} ms).\n"
+        f.write(summary)
+        print(summary, end="")
 
-best_grid = all_results[0][0]
-best_time = all_results[0][1]
-summary = f"\nOptimal Grid for M=256 is {best_grid} ({best_time:.4f} ms).\nResults saved to {output_file}."
-print(summary)
-with open(output_file, "a") as f:
-    f.write(summary + "\n")
-
+print(f"\nAll results saved to {output_file}.")
