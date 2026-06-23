@@ -16,9 +16,7 @@
       const float *__restrict__ global_scale_ptr,                              \
       const int4 *__restrict__ zp_ptr, const int *__restrict__ g_idx,          \
       int num_groups, int prob_m, int prob_n, int prob_k, int lda, int *locks, \
-      bool has_bias, bool use_atomic_add, bool use_fp32_reduce,                \
-      int max_shared_mem, int sk_part2_mn_tiles, int sk_part1_mn_iters,      \
-      int sk_slice_iters
+      bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
