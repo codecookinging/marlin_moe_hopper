@@ -129,6 +129,7 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
+    {64, 256, 256},
     {128, 64, 128},
     {128, 256, 256},
   };
@@ -318,8 +319,7 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    printf("allow_count = %d, reg_size = %d, cache_size = %d\n", allow_count,
-           reg_size, cache_size);
+    printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
