@@ -217,7 +217,7 @@ def generate_new_kernels():
                     #     we only need (128, 128, 256)
                     # for large batch (m_blocks > 1),
                     #     we only need (64, 256, 256)
-                    if m_blocks <= 1 and (thread_k, thread_n) != (128, 128):
+                    if m_blocks <= 1 and (thread_k, thread_n) not in [(128, 128), (64, 256)]:
                         continue
                     if m_blocks > 1 and (thread_k, thread_n) != (64, 256):
                         continue
