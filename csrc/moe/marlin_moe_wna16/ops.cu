@@ -129,9 +129,10 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
+    {64, 256, 128},
     {64, 256, 256},
-    // {128, 64, 128},
-    // {128, 256, 256},
+    {128, 64, 128},
+    {128, 256, 256},
   };
 
 thread_config_t large_batch_thread_configs[] = {
@@ -317,9 +318,12 @@ exec_config_t determine_exec_config(
     cudaFuncAttributes attr;
     cudaFuncGetAttributes(&attr, kernel);
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
-    int allow_count = min(device_max_reg_size / reg_size,
-                          max_shared_mem / (cache_size + 1536));
-    printf("allow_count = %d, thread_m_blocks = %d, thread_configs_size=%d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, thread_configs_size, th_config.thread_k, th_config.thread_n, th_config.num_threads);
+
+    int rg_allow = device_max_reg_size / reg_size;
+    int share_allow = max_shared_mem / (cache_size + 1536);
+
+    int allow_count = min(rg_allow, share_allow);
+    printf("allow_count = %d, thread_m_blocks = %d, thread_configs_size=%d, thread_k = %d, thread_n = %d, num_threads = %d, rg_allow = %d, share_allow = %d\n", allow_count, thread_m_blocks, thread_configs_size, th_config.thread_k, th_config.thread_n, th_config.num_threads, rg_allow, share_allow);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
