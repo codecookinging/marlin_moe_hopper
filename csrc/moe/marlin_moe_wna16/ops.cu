@@ -498,8 +498,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k_blocks = %d, thread_n_blocks = %d\n",
-         exec_cfg.blocks_per_sm, sms, num_threads, thread_k_blocks, thread_n_blocks);
+  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k = %d, thread_n = %d\n",
+         exec_cfg.blocks_per_sm, sms, num_threads, thread_k, thread_n);
 
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
