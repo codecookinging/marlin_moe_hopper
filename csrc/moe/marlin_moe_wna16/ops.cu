@@ -1,5 +1,8 @@
 #include <cstdlib>
 #include <cstdio>
+#include <algorithm>
+#include <vector>
+#include <cuda_runtime.h>
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
@@ -127,10 +130,11 @@ thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
-    {128, 128, 256},
-    {64, 128, 128},
-    {128, 64, 128},
-    {128, 256, 256},
+    {64, 256, 128},
+    // {128, 128, 256},
+    // {64, 128, 128},
+    // {128, 64, 128},
+    // {128, 256, 256},
   };
 
 thread_config_t large_batch_thread_configs[] = {
@@ -145,6 +149,79 @@ typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
 } exec_config_t;
+
+struct StreamKHostParams {
+  int k_tiles;
+  int part2_mn_tiles;
+  int iters;
+};
+
+StreamKHostParams compute_streamk_host_params(int parallel_padded, int prob_k,
+                                              int prob_n, int thread_k_blocks,
+                                              int thread_n_blocks,
+                                              int logical_blocks) {
+  int k_tiles = prob_k / 16 / thread_k_blocks;
+  int n_tiles = prob_n / 16 / thread_n_blocks;
+  int global_mn_tiles = parallel_padded * n_tiles;
+  int part2_mn_tiles = global_mn_tiles;
+  if (global_mn_tiles > logical_blocks) {
+    part2_mn_tiles = global_mn_tiles % logical_blocks;
+    if (part2_mn_tiles * 3 <= logical_blocks) {
+      part2_mn_tiles += logical_blocks;
+    }
+  }
+  int iters = div_ceil(k_tiles * part2_mn_tiles, logical_blocks);
+  return {k_tiles, part2_mn_tiles, iters};
+}
+
+struct ClusterLaunchPlan {
+  int physical_blocks = 0;
+  int cluster_size = 1;
+  int max_batch_size = 1;
+  std::vector<int> phys_to_logical;
+};
+
+ClusterLaunchPlan build_cluster_launch_plan(int logical_blocks, int cluster_size,
+                                            int k_tiles, int iters,
+                                            int part2_mn_tiles) {
+  ClusterLaunchPlan plan;
+  plan.cluster_size = cluster_size;
+  plan.phys_to_logical.reserve(
+      ((logical_blocks + cluster_size - 1) / cluster_size) * cluster_size * 2);
+
+  if (part2_mn_tiles >= logical_blocks) {
+    for (int b = 0; b < logical_blocks; ++b) {
+      plan.phys_to_logical.push_back(b);
+    }
+    plan.physical_blocks = logical_blocks;
+    return plan;
+  }
+
+  int b = 0;
+  while (b < logical_blocks) {
+    int group_key = (iters * b) / k_tiles;
+    int end = b + 1;
+    while (end < logical_blocks && (iters * end) / k_tiles == group_key) {
+      ++end;
+    }
+    int pos = b;
+    while (pos < end) {
+      const int batch_size = std::min(cluster_size, end - pos);
+      plan.max_batch_size = std::max(plan.max_batch_size, batch_size);
+      const int batch_high = end - 1 - (pos - b);
+      for (int rank = 0; rank < batch_size; ++rank) {
+        plan.phys_to_logical.push_back(batch_high - rank);
+      }
+      for (int pad = batch_size; pad < cluster_size; ++pad) {
+        plan.phys_to_logical.push_back(-1);
+      }
+      pos += batch_size;
+    }
+    b = end;
+  }
+  plan.physical_blocks = static_cast<int>(plan.phys_to_logical.size());
+  return plan;
+}
 
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
                           int prob_n, int prob_k, int num_bits, int group_size,
@@ -318,7 +395,7 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
+    // printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
@@ -350,7 +427,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               bool use_fp32_reduce, bool is_zp_float,
+               int num_tokens_past_padded_count, bool use_cluster_reduce) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -398,6 +476,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       (const int32_t*)num_tokens_past_padded;
   const float* topk_weights_ptr = (const float*)topk_weights;
   int* locks = (int*)workspace;
+  int* cluster_cta_map_dev = nullptr;
+  const int* cluster_cta_map_ptr = nullptr;
+  int cluster_map_bytes = 0;
 
   if (has_act_order) {
     // Permute A columns
@@ -497,13 +578,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k = %d, thread_n = %d\n",
-         exec_cfg.blocks_per_sm, sms, num_threads, thread_k, thread_n);
-
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
   if (force_grid_env) {
-      blocks = std::atoi(force_grid_env);
+    blocks = std::atoi(force_grid_env);
   }
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
@@ -547,13 +625,77 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
+
+  int cluster_size = 1;
+  if (use_cluster_reduce) {
+    cluster_size = 8;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+    cudaLaunchConfig_t occ_cfg{};
+    occ_cfg.blockDim = num_threads;
+    occ_cfg.dynamicSmemBytes = max_shared_mem;
+    int max_cluster = 0;
+    if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) ==
+            cudaSuccess &&
+        max_cluster > 0) {
+      cluster_size = std::min(max_cluster, 8);
+    }
+#endif
+
+    int parallel_padded = num_tokens_past_padded_count / moe_block_size;
+    StreamKHostParams sk = compute_streamk_host_params(
+        parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
+        blocks);
+    ClusterLaunchPlan plan = build_cluster_launch_plan(
+        blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
+
+    if (sk.part2_mn_tiles >= blocks) {
+      use_cluster_reduce = false;
+      cluster_size = 1;
+      cluster_cta_map_dev = nullptr;
+      cluster_cta_map_ptr = nullptr;
+      locks = (int*)workspace;
+    } else {
+      blocks = plan.physical_blocks;
+      cluster_map_bytes = blocks * static_cast<int>(sizeof(int));
+      cluster_cta_map_dev = locks;
+      cluster_cta_map_ptr = cluster_cta_map_dev;
+      locks = locks + blocks;
+      cudaMemcpyAsync(cluster_cta_map_dev, plan.phys_to_logical.data(),
+                      cluster_map_bytes, cudaMemcpyHostToDevice, stream);
+      cudaFuncSetAttribute(kernel,
+                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    }
+  }
+
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
-  kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
-      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+  if (use_cluster_reduce && cluster_size > 1) {
+    cudaLaunchConfig_t config{};
+    config.gridDim = blocks;
+    config.blockDim = num_threads;
+    config.dynamicSmemBytes = max_shared_mem;
+    config.stream = stream;
+    cudaLaunchAttribute attr{};
+    attr.id = cudaLaunchAttributeClusterDimension;
+    attr.val.clusterDim.x = cluster_size;
+    attr.val.clusterDim.y = 1;
+    attr.val.clusterDim.z = 1;
+    config.attrs = &attr;
+    config.numAttrs = 1;
+    cudaLaunchKernelEx(
+        &config, kernel, A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr,
+        b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr, sorted_token_ids_ptr,
+        expert_ids_ptr, num_tokens_past_padded_ptr, topk_weights_ptr, top_k,
+        mul_topk_weights, num_groups, prob_m, prob_n, prob_k, cluster_cta_map_ptr,
+        locks, has_bias, use_atomic_add, use_fp32_reduce, use_cluster_reduce);
+  } else {
+    kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+        sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+        topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
+        prob_n, prob_k, cluster_cta_map_ptr, locks, has_bias, use_atomic_add,
+        use_fp32_reduce, use_cluster_reduce);
+  }
   // clang-format on
 }
 
@@ -714,6 +856,26 @@ torch::Tensor moe_wna16_marlin_gemm(
     c = torch::empty({size_m * top_k, size_n}, options);
   }
 
+  // Prefer direct output atomics over the serialized lock/C_tmp global reduce
+  // path. This keeps the Stream-K tail from paying a full FP32 temp-buffer
+  // reduction unless explicitly requested for debugging/accuracy checks.
+  const char* force_lock_reduce_env = std::getenv("MARLIN_MOE_FORCE_LOCK_REDUCE");
+  if (!(force_lock_reduce_env != nullptr && force_lock_reduce_env[0] == '1')) {
+    use_atomic_add = true;
+  }
+
+  const char* force_fp32_reduce_env = std::getenv("MARLIN_MOE_FORCE_FP32_REDUCE");
+  if (!(force_fp32_reduce_env != nullptr && force_fp32_reduce_env[0] == '1')) {
+    use_fp32_reduce = false;
+  }
+
+  bool use_cluster_reduce = false;
+  const char* cluster_reduce_env = std::getenv("MARLIN_MOE_USE_CLUSTER_REDUCE");
+  if (cluster_reduce_env != nullptr && cluster_reduce_env[0] == '1') {
+    use_cluster_reduce = true;
+    use_atomic_add = false;
+  }
+
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
@@ -862,13 +1024,25 @@ torch::Tensor moe_wna16_marlin_gemm(
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int min_workspace_size = min(
-      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+  int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
+  int parallel_padded = num_tokens_past_padded_count / (int)moe_block_size;
+  int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
+
+  int dev = a.get_device();
+  int major_capability = 0;
+  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
+                         dev);
+  if (!use_cluster_reduce || major_capability < 9) {
+    use_cluster_reduce = false;
+  }
+  if (use_cluster_reduce) {
+    int max_logical_blocks = sms * (int)blocks_per_sm;
+    min_workspace_size += max_logical_blocks * 2;
+  }
+
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
-
-  int dev = a.get_device();
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
@@ -891,7 +1065,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float);
+      is_zp_float, num_tokens_past_padded_count, use_cluster_reduce);
 
   return c;
 }

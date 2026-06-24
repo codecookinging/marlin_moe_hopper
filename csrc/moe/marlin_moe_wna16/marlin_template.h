@@ -76,9 +76,11 @@ __global__ void Marlin(
     int prob_m,             // batch dimension m
     int prob_n,             // output dimension n
     int prob_k,             // reduction dimension k
+    const int* __restrict__ cluster_cta_map,  // phys->logical CTA map (SM90)
     int* locks,             // extra global storage for barrier synchronization
-    bool use_atomic_add,    // whether to use atomic add to reduce
-    bool use_fp32_reduce    // whether to use fp32 global reduce
+    bool use_atomic_add,       // whether to use atomic add to reduce
+    bool use_fp32_reduce,      // whether to use fp32 global reduce
+    bool use_cluster_reduce    // whether to use Hopper cluster DSMEM reduce
 ) {}
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -277,10 +279,12 @@ __global__ void Marlin(
     int prob_m,             // batch dimension m
     int prob_n,             // output dimension n
     int prob_k,             // reduction dimension k
+    const int* __restrict__ cluster_cta_map,  // phys->logical CTA map (SM90)
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool use_cluster_reduce  // whether to use Hopper cluster DSMEM reduce
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -307,6 +311,13 @@ __global__ void Marlin(
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
+
+  int cta_block = blockIdx.x;
+  if (use_cluster_reduce) {
+    if (cluster_cta_map == nullptr) return;
+    cta_block = cluster_cta_map[blockIdx.x];
+    if (cta_block < 0) return;
+  }
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   static constexpr auto num_bits =
@@ -421,7 +432,7 @@ __global__ void Marlin(
   }
 
   int slice_row = 0;
-  int slice_col_par = blockIdx.x;
+  int slice_col_par = cta_block;
   int slice_col;
   int slice_iters =
       k_tiles;  // number of threadblock tiles in the current slice
@@ -460,9 +471,9 @@ __global__ void Marlin(
   if (part2_mn_tiles >= gridDim.x) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
+    locks_off = cta_block;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = (iters * cta_block) / k_tiles - 1;
   }
 
   int prob_m_top_k = prob_m * top_k;
@@ -571,7 +582,7 @@ __global__ void Marlin(
   bool first_init = true;
   auto init_part2_slice = [&]() {
     slice_iters =
-        iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
+        iters * (cta_block + 1) - (k_tiles * slice_col_par + slice_row);
     if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
@@ -582,7 +593,7 @@ __global__ void Marlin(
       int col_off = col_first - k_tiles * slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
+      int delta_first = iters * cta_block - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -598,7 +609,8 @@ __global__ void Marlin(
       locks_off++;
     }
 
-    if (first_init && use_atomic_add && slice_count > 1 && slice_idx == 0) {
+    if (first_init && use_atomic_add && !use_cluster_reduce &&
+        slice_count > 1 && slice_idx == 0) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(block_num_valid_tokens, threads / threads_per_m);
@@ -651,8 +663,8 @@ __global__ void Marlin(
   auto init_slice = [&]() {
     if (!in_part2 && !part1_mn_iters) {
       in_part2 = true;
-      slice_col_par = (iters * blockIdx.x) / k_tiles;
-      slice_row = (iters * blockIdx.x) % k_tiles;
+      slice_col_par = (iters * cta_block) / k_tiles;
+      slice_row = (iters * cta_block) % k_tiles;
       slice_col = (slice_col_par + global_mn_tiles - part2_mn_tiles) % n_tiles;
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       update_next_moe_block_data();
@@ -1812,7 +1824,7 @@ __global__ void Marlin(
   // Write out the reduce final result in the correct layout. We only actually
   // reshuffle matrix fragments in this step, the reduction above is performed
   // in fragment layout.
-  auto write_result = [&](bool last) {
+  auto write_result = [&](bool last, bool force_atomic = false) {
     int c_gl_stride = prob_n / 8;
     constexpr int c_sh_stride = 2 * thread_n_blocks + 1;
     int c_gl_wr_delta = c_gl_stride * (threads / (2 * thread_n_blocks));
@@ -1923,7 +1935,7 @@ __global__ void Marlin(
         int64_t true_idx = sorted_row * c_gl_stride + c_gl_wr % c_gl_stride;
         c_scalar_t2 topk_weight_score;
         if (mul_topk_weights) topk_weight_score = sh_block_topk_weights[row];
-        if (use_atomic_add && slice_count > 1 || mul_topk_weights) {
+        if ((use_atomic_add || force_atomic) && slice_count > 1 || mul_topk_weights) {
           c_scalar_t2* C_half2 = reinterpret_cast<c_scalar_t2*>(&C[true_idx]);
           c_scalar_t2* sh_red_half2 =
               reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
@@ -1934,7 +1946,7 @@ __global__ void Marlin(
             }
           }
 
-          if (use_atomic_add && slice_count > 1) {
+          if ((use_atomic_add || force_atomic) && slice_count > 1) {
   #pragma unroll
             for (int a = 0; a < 4; a++) {
               atomicAdd(&C_half2[a], sh_red_half2[a]);
@@ -2212,31 +2224,100 @@ __global__ void Marlin(
         }
       }
 
-      if (slice_count > 1 && !use_atomic_add) {
-        // only globally reduce if there is more than one block in a slice
-        barrier_acquire(&locks[locks_off], slice_idx);
-        if (use_fp32_reduce) {
-          global_reduce_fp32(slice_idx == 0, last);
+      bool cluster_reduced = false;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+      if (use_cluster_reduce && in_part2 && slice_count > 1) {
+        constexpr int cluster_num_floats =
+            thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
+        marlin_hopper::ClusterReduceStatus cluster_status =
+            marlin_hopper::cluster_streamk_reduce(
+                reinterpret_cast<float*>(&frag_c), cluster_num_floats, sh_red,
+                slice_col_par, slice_idx, slice_count);
+        if (cluster_status.ok) {
+          cluster_reduced = true;
+          if (cluster_status.merge_batches) {
+            cooperative_groups::cluster_group cluster =
+                cooperative_groups::this_cluster();
+            const int cluster_size = cluster.num_blocks();
+            const int batch_id = slice_idx / cluster_size;
+            const int local_slice_idx = slice_idx - batch_id * cluster_size;
+            const int num_batches =
+                (slice_count + cluster_size - 1) / cluster_size;
+            if (local_slice_idx == 0) {
+              if (batch_id == 0) {
+                constexpr int threads_per_m = 16 * thread_n_blocks / 8;
+                int m_per_thread = div_ceil(block_num_valid_tokens,
+                                            threads / threads_per_m);
+                for (int i = 0; i < m_per_thread; i++) {
+                  int row =
+                      threads / threads_per_m * i + threadIdx.x / threads_per_m;
+                  if (row < block_num_valid_tokens) {
+                    int64_t sorted_row = sh_block_sorted_ids[row];
+                    int col = slice_col * 16 * thread_n_blocks / 8 +
+                              threadIdx.x % threads_per_m;
+                    C[sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
+                  }
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) locks[locks_off] = 1 - num_batches;
+              } else {
+                wait_negative_and_add(&locks[locks_off]);
+              }
+              if (has_bias && batch_id == 0) {
+                cp_async_wait<0>();
+                __syncthreads();
+                reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
+                if constexpr (!is_a_8bit)
+                  reinterpret_cast<int4*>(&frag_bias)[1] =
+                      sh_bias[bias_sh_rd + 4];
+                __syncthreads();
+              }
+              write_result(true, true);
+            }
+          } else if (slice_idx == 0) {
+            if (has_bias) {
+              cp_async_wait<0>();
+              __syncthreads();
+              reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
+              if constexpr (!is_a_8bit)
+                reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
+              __syncthreads();
+            }
+            write_result(true);
+          }
         } else {
-          global_reduce_fp16(slice_idx == 0, last);
+          cluster_reduced = false;
         }
-        barrier_release(&locks[locks_off], last);
       }
+#endif
 
-      if (has_bias && last) {
-        cp_async_wait<0>();
-        __syncthreads();
-        reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
-        if constexpr (!is_a_8bit)
-          reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
-        __syncthreads();
+      if (!cluster_reduced) {
+        if (slice_count > 1 && !use_atomic_add) {
+          // only globally reduce if there is more than one block in a slice
+          barrier_acquire(&locks[locks_off], slice_idx);
+          if (use_fp32_reduce) {
+            global_reduce_fp32(slice_idx == 0, last);
+          } else {
+            global_reduce_fp16(slice_idx == 0, last);
+          }
+          barrier_release(&locks[locks_off], last);
+        }
+
+        if (has_bias && last) {
+          cp_async_wait<0>();
+          __syncthreads();
+          reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
+          if constexpr (!is_a_8bit)
+            reinterpret_cast<int4*>(&frag_bias)[1] = sh_bias[bias_sh_rd + 4];
+          __syncthreads();
+        }
+
+        if (use_atomic_add && slice_count > 1 && slice_idx != 0)
+          wait_negative_and_add(&locks[locks_off]);
+        if (last || use_atomic_add)
+          // only the last block in a slice actually writes the result
+          write_result(last);
       }
-
-      if (use_atomic_add && slice_count > 1 && slice_idx != 0)
-        wait_negative_and_add(&locks[locks_off]);
-      if (last || use_atomic_add)
-        // only the last block in a slice actually writes the result
-        write_result(last);
       slice_row = 0;
       if (!in_part2) {
         slice_col_par += gridDim.x;
