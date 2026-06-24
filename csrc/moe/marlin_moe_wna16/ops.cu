@@ -127,13 +127,11 @@ thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
 
     // thread_k, thread_n, num_threads
+    {64, 256, 128},
     // {128, 128, 256},
     // {64, 128, 128},
-    {64, 256, 128},
-    // {64, 256, 256},
     // {128, 64, 128},
     // {128, 256, 256},
-    // {128, 256, 128},
   };
 
 thread_config_t large_batch_thread_configs[] = {
@@ -253,7 +251,6 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
       get_kernel_cache_size(th_config, m_block_size_8, thread_m_blocks, prob_m,
                             prob_n, prob_k, num_bits, group_size, has_act_order,
                             is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
-  // printf("cache_size = %d, max_shared_mem = %d\n", cache_size, max_shared_mem);
   return cache_size <= max_shared_mem;
 }
 
@@ -296,11 +293,6 @@ exec_config_t determine_exec_config(
                          prob_n, prob_k, num_bits, group_size, has_act_order,
                          is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
                          max_shared_mem - 512)) {
-      // printf("Invalid thread config: thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d for MKN = [%d, %d, %d] and num_bits = %d, group_size = %d, has_act_order = %d, is_k_full = %d, has_zp = %d, is_zp_float = %d, max_shared_mem = %d\n",
-      //        thread_m_blocks, th_config.thread_k, th_config.thread_n,
-      //        th_config.num_threads, prob_m, prob_n, prob_k, num_bits,
-      //        group_size, has_act_order, is_k_full, has_zp, is_zp_float,
-      //        max_shared_mem - 512);
       continue;
     }
 
@@ -325,12 +317,9 @@ exec_config_t determine_exec_config(
     cudaFuncAttributes attr;
     cudaFuncGetAttributes(&attr, kernel);
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
-
-    int rg_allow = device_max_reg_size / reg_size;
-    int share_allow = max_shared_mem / (cache_size + 1536);
-
-    int allow_count = min(rg_allow, share_allow);
-    // printf("allow_count = %d, thread_m_blocks = %d, thread_configs_size=%d, thread_k = %d, thread_n = %d, num_threads = %d, rg_allow = %d, share_allow = %d\n", allow_count, thread_m_blocks, thread_configs_size, th_config.thread_k, th_config.thread_n, th_config.num_threads, rg_allow, share_allow);
+    int allow_count = min(device_max_reg_size / reg_size,
+                          max_shared_mem / (cache_size + 1536));
+    printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
@@ -509,8 +498,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-  // printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k = %d, thread_n = %d\n",
-  //        exec_cfg.blocks_per_sm, sms, num_threads, thread_k, thread_n);
+  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k = %d, thread_n = %d\n",
+         exec_cfg.blocks_per_sm, sms, num_threads, thread_k, thread_n);
 
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
