@@ -129,7 +129,9 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {128, 128, 256},
     {64, 128, 128},
-    {128, 64, 128}};
+    {128, 64, 128},
+    {128, 256, 256},
+  };
 
 thread_config_t large_batch_thread_configs[] = {
     // Ordered by priority
@@ -496,8 +498,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-  printf("blocks_per_sm = %d, sms = %d, num_threads = %d\n",
-         exec_cfg.blocks_per_sm, sms, num_threads);
+  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k_blocks = %d, thread_n_blocks = %d\n",
+         exec_cfg.blocks_per_sm, sms, num_threads, thread_k_blocks, thread_n_blocks);
 
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
