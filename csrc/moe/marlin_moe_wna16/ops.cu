@@ -252,6 +252,7 @@ bool is_valid_config(thread_config_t const& th_config, bool m_block_size_8,
       get_kernel_cache_size(th_config, m_block_size_8, thread_m_blocks, prob_m,
                             prob_n, prob_k, num_bits, group_size, has_act_order,
                             is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
+  printf("cache_size = %d, max_shared_mem = %d\n", cache_size, max_shared_mem);
   return cache_size <= max_shared_mem;
 }
 
@@ -294,6 +295,11 @@ exec_config_t determine_exec_config(
                          prob_n, prob_k, num_bits, group_size, has_act_order,
                          is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
                          max_shared_mem - 512)) {
+      printf("Invalid thread config: thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d for MKN = [%d, %d, %d] and num_bits = %d, group_size = %d, has_act_order = %d, is_k_full = %d, has_zp = %d, is_zp_float = %d, max_shared_mem = %d\n",
+             thread_m_blocks, th_config.thread_k, th_config.thread_n,
+             th_config.num_threads, prob_m, prob_n, prob_k, num_bits,
+             group_size, has_act_order, is_k_full, has_zp, is_zp_float,
+             max_shared_mem - 512);
       continue;
     }
 
