@@ -131,6 +131,7 @@ def test_marlin_moe_symbols_available():
         "topk_sigmoid",
         "grouped_topk",
         "moe_align_block_size",
+        "moe_align_block_size_packed",
         "batched_moe_align_block_size",
         "moe_wna16_marlin_gemm",
     ]
@@ -149,12 +150,12 @@ def test_topk_softmax_and_align_block_size_shapes():
     assert topk_ids.shape == (8, 2)
     assert token_expert_indices.shape == (8, 2)
 
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
-        topk_ids, block_size=16, num_experts=16
+    align = moe.moe_align_block_size(
+        topk_ids, block_size=16, num_experts=16, use_packed=False
     )
-    assert sorted_ids.dtype == torch.int32
-    assert expert_ids.dtype == torch.int32
-    assert num_tokens_post_pad.dtype == torch.int32
+    assert align.sorted_ids.dtype == torch.int32
+    assert align.expert_ids.dtype == torch.int32
+    assert align.num_tokens_post_pad.dtype == torch.int32
 
 
 def test_topk_softmax_matches_reference():
@@ -189,18 +190,48 @@ def test_moe_align_block_size_matches_reference():
     topk_ids = torch.tensor(
         [[0, 3], [1, 3], [0, 2], [1, 0]], device="cuda", dtype=torch.int32
     )
-    sorted_ids, expert_ids, num_tokens_post_pad = moe.moe_align_block_size(
-        topk_ids, block_size=4, num_experts=4
+    align = moe.moe_align_block_size(
+        topk_ids, block_size=4, num_experts=4, use_packed=False
     )
     ref_sorted_ids, ref_expert_ids, ref_num_tokens_post_pad = _moe_align_block_size_reference(
         topk_ids, block_size=4, num_experts=4
     )
 
-    actual_num_tokens_post_pad = int(num_tokens_post_pad.item())
+    actual_num_tokens_post_pad = int(align.num_tokens_post_pad.item())
     assert actual_num_tokens_post_pad == int(ref_num_tokens_post_pad.item())
-    assert torch.equal(sorted_ids[:actual_num_tokens_post_pad], ref_sorted_ids)
-    assert torch.equal(expert_ids[: ref_expert_ids.numel()], ref_expert_ids)
-    assert torch.all(sorted_ids[actual_num_tokens_post_pad:] == topk_ids.numel())
+    assert torch.equal(
+        align.sorted_ids[:actual_num_tokens_post_pad], ref_sorted_ids
+    )
+    assert torch.equal(align.expert_ids[: ref_expert_ids.numel()], ref_expert_ids)
+    assert torch.all(align.sorted_ids[actual_num_tokens_post_pad:] == topk_ids.numel())
+
+
+def test_packed_align_reduces_moe_blocks():
+    _require_moe_cuda()
+
+    topk_ids = torch.tensor(
+        [[0], [1], [2], [3]], device="cuda", dtype=torch.int32
+    )
+    legacy = moe.moe_align_block_size(
+        topk_ids, block_size=4, num_experts=4, use_packed=False
+    )
+    packed = moe.moe_align_block_size(topk_ids, block_size=4, num_experts=4, use_packed=True)
+
+    legacy_blocks = int(legacy.num_tokens_post_pad.item()) // 4
+    packed_blocks = int(packed.num_tokens_post_pad.item()) // 4
+    assert packed_blocks == 1
+    assert legacy_blocks == 4
+    assert packed_blocks < legacy_blocks
+
+    legacy_tokens = sorted(
+        legacy.sorted_ids[: int(legacy.num_tokens_post_pad.item())].tolist()
+    )
+    packed_tokens = sorted(
+        packed.sorted_ids[: int(packed.block_token_offsets[-1].item())].tolist()
+    )
+    assert legacy_tokens == packed_tokens
+    assert packed.block_num_segments is not None
+    assert int(packed.block_num_segments[0].item()) == 4
 
 
 def test_grouped_topk_shapes():

@@ -23,6 +23,20 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
   m.def(
+      "moe_align_block_size_packed(Tensor topk_ids, int num_experts,"
+      "                     int block_size, Tensor! sorted_token_ids,"
+      "                     Tensor! experts_ids,"
+      "                     Tensor! num_tokens_post_pad,"
+      "                     Tensor! block_token_offsets,"
+      "                     Tensor! block_num_segments,"
+      "                     Tensor! block_segment_experts,"
+      "                     Tensor! block_segment_row_starts,"
+      "                     Tensor! block_segment_counts,"
+      "                     Tensor? maybe_expert_map) -> ()");
+  m.impl("moe_align_block_size_packed", torch::kCUDA,
+         &moe_align_block_size_packed);
+
+  m.def(
       "batched_moe_align_block_size(int max_tokens_per_batch,"
       "                     int block_size, Tensor expert_num_tokens,"
       "                     Tensor! sorted_token_ids,"
@@ -44,7 +58,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int size_m, int size_n, int size_k,"
       "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
-      "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
+      "int thread_k, int thread_n, int blocks_per_sm,"
+      "Tensor? block_token_offsets_or_none,"
+      "Tensor? block_num_segments_or_none,"
+      "Tensor? block_segment_experts_or_none,"
+      "Tensor? block_segment_row_starts_or_none,"
+      "Tensor? block_segment_counts_or_none) -> Tensor");
 
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "

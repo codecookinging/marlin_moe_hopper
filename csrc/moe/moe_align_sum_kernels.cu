@@ -10,7 +10,124 @@
 #include "../dispatch_utils.h"
 #include "core/math.hpp"
 
+#include <algorithm>
+#include <vector>
+
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
+
+namespace {
+
+constexpr int32_t kMaxSegmentsPerBlock = 16;
+
+struct PackedMoeBlock {
+  int32_t num_segments = 0;
+  int32_t first_expert = -1;
+  int32_t token_start = 0;
+  int32_t token_count = 0;
+  int32_t segment_experts[kMaxSegmentsPerBlock];
+  int32_t segment_row_starts[kMaxSegmentsPerBlock];
+  int32_t segment_counts[kMaxSegmentsPerBlock];
+};
+
+// Greedy bin-pack consecutive experts into MoE blocks.  Multiple small experts
+// can share one block when their token counts sum to <= block_size.
+void pack_moe_blocks_cpu(const int32_t* expert_counts_in, int32_t num_experts,
+                         int32_t block_size,
+                         std::vector<PackedMoeBlock>& blocks,
+                         std::vector<int32_t>& dense_cumsum) {
+  blocks.clear();
+  dense_cumsum.assign(num_experts + 1, 0);
+  std::vector<int32_t> remaining(num_experts);
+  for (int32_t e = 0; e < num_experts; ++e) {
+    remaining[e] = expert_counts_in[e];
+    dense_cumsum[e + 1] = dense_cumsum[e] + expert_counts_in[e];
+  }
+
+  int32_t e = 0;
+  while (e < num_experts) {
+    if (remaining[e] == 0) {
+      ++e;
+      continue;
+    }
+    PackedMoeBlock block;
+    int32_t block_fill = 0;
+    while (e < num_experts) {
+      if (remaining[e] == 0) {
+        ++e;
+        continue;
+      }
+      const int32_t take = std::min(remaining[e], block_size - block_fill);
+      if (take <= 0) {
+        break;
+      }
+      block.segment_experts[block.num_segments] = e;
+      block.segment_row_starts[block.num_segments] = block_fill;
+      block.segment_counts[block.num_segments] = take;
+      ++block.num_segments;
+      block_fill += take;
+      remaining[e] -= take;
+      if (remaining[e] > 0) {
+        break;
+      }
+      ++e;
+      if (block_fill == block_size) {
+        break;
+      }
+    }
+    block.token_count = block_fill;
+    block.first_expert = block.segment_experts[0];
+    blocks.push_back(block);
+  }
+}
+
+template <typename scalar_t>
+__global__ void count_expert_tokens_kernel(
+    const scalar_t* __restrict__ topk_ids, int32_t* __restrict__ expert_counts,
+    int32_t* __restrict__ expert_map, int32_t num_experts, size_t numel,
+    bool has_expert_map) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+  for (size_t i = tid; i < numel; i += stride) {
+    int32_t expert_id = static_cast<int32_t>(topk_ids[i]);
+    if (expert_id >= num_experts) {
+      continue;
+    }
+    if (has_expert_map) {
+      expert_id = expert_map[expert_id];
+      if (expert_id == -1) {
+        continue;
+      }
+    }
+    atomicAdd(&expert_counts[expert_id], 1);
+  }
+}
+
+template <typename scalar_t>
+__global__ void sort_expert_tokens_dense_kernel(
+    const scalar_t* __restrict__ topk_ids, int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ write_cursor, const int32_t* __restrict__ expert_offsets,
+    int32_t* __restrict__ expert_map, int32_t num_experts, size_t numel,
+    bool has_expert_map) {
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+  for (size_t i = tid; i < numel; i += stride) {
+    int32_t expert_id = static_cast<int32_t>(topk_ids[i]);
+    if (expert_id >= num_experts) {
+      continue;
+    }
+    if (has_expert_map) {
+      expert_id = expert_map[expert_id];
+      if (expert_id == -1) {
+        continue;
+      }
+    }
+    int32_t rank = atomicAdd(&write_cursor[expert_id], 1);
+    sorted_token_ids[expert_offsets[expert_id] + rank] =
+        static_cast<int32_t>(i);
+  }
+}
+
+}  // namespace
 
 namespace vllm {
 namespace moe {
@@ -756,4 +873,149 @@ void moe_lora_align_block_size(
               lora_ids.data_ptr<int32_t>(), has_expert_map);
         }
       });
+}
+
+void moe_align_block_size_packed(
+    torch::Tensor topk_ids, int64_t num_experts, int64_t block_size,
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_post_pad, torch::Tensor block_token_offsets,
+    torch::Tensor block_num_segments, torch::Tensor block_segment_experts,
+    torch::Tensor block_segment_row_starts, torch::Tensor block_segment_counts,
+    std::optional<torch::Tensor> maybe_expert_map) {
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int32_t num_experts_i = static_cast<int32_t>(num_experts);
+  const int32_t block_size_i = static_cast<int32_t>(block_size);
+  const size_t numel = topk_ids.numel();
+
+  TORCH_CHECK(sorted_token_ids.scalar_type() == torch::kInt32);
+  TORCH_CHECK(expert_ids.scalar_type() == torch::kInt32);
+  TORCH_CHECK(num_tokens_post_pad.scalar_type() == torch::kInt32);
+  TORCH_CHECK(block_token_offsets.scalar_type() == torch::kInt32);
+  TORCH_CHECK(block_num_segments.scalar_type() == torch::kInt32);
+  TORCH_CHECK(block_segment_experts.scalar_type() == torch::kInt32);
+  TORCH_CHECK(block_segment_row_starts.scalar_type() == torch::kInt32);
+  TORCH_CHECK(block_segment_counts.scalar_type() == torch::kInt32);
+  TORCH_CHECK(sorted_token_ids.numel() >= static_cast<int64_t>(numel));
+
+  bool has_expert_map = maybe_expert_map.has_value();
+  torch::Tensor expert_map;
+  if (has_expert_map) {
+    expert_map = maybe_expert_map.value();
+  } else {
+    expert_map = torch::empty({0}, sorted_token_ids.options());
+  }
+
+  auto options_int = sorted_token_ids.options();
+  torch::Tensor expert_counts = torch::zeros({num_experts_i}, options_int);
+  torch::Tensor write_cursor = torch::zeros({num_experts_i}, options_int);
+  torch::Tensor expert_offsets = torch::empty({num_experts_i}, options_int);
+
+  const int block_threads = 256;
+  const int count_blocks =
+      static_cast<int>((numel + block_threads - 1) / block_threads);
+
+  VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
+      topk_ids.scalar_type(), "moe_align_block_size_packed", [&] {
+        count_expert_tokens_kernel<scalar_t>
+            <<<count_blocks, block_threads, 0, stream>>>(
+                topk_ids.data_ptr<scalar_t>(),
+                expert_counts.data_ptr<int32_t>(),
+                expert_map.data_ptr<int32_t>(), num_experts_i, numel,
+                has_expert_map);
+      });
+
+  std::vector<int32_t> counts_host(num_experts_i);
+  std::vector<int32_t> dense_cumsum;
+  std::vector<PackedMoeBlock> blocks;
+  cudaMemcpyAsync(counts_host.data(), expert_counts.data_ptr<int32_t>(),
+                  num_experts_i * sizeof(int32_t), cudaMemcpyDeviceToHost,
+                  stream);
+  cudaStreamSynchronize(stream);
+
+  pack_moe_blocks_cpu(counts_host.data(), num_experts_i, block_size_i, blocks,
+                      dense_cumsum);
+
+  const int32_t num_moe_blocks = static_cast<int32_t>(blocks.size());
+  const int32_t num_tokens_post_pad_val = num_moe_blocks * block_size_i;
+
+  TORCH_CHECK(block_token_offsets.numel() >= num_moe_blocks + 1);
+  TORCH_CHECK(expert_ids.numel() >= num_moe_blocks);
+  TORCH_CHECK(block_num_segments.numel() >= num_moe_blocks);
+  TORCH_CHECK(block_segment_experts.numel() >=
+              static_cast<int64_t>(num_moe_blocks) * kMaxSegmentsPerBlock);
+  TORCH_CHECK(block_segment_row_starts.numel() >=
+              static_cast<int64_t>(num_moe_blocks) * kMaxSegmentsPerBlock);
+  TORCH_CHECK(block_segment_counts.numel() >=
+              static_cast<int64_t>(num_moe_blocks) * kMaxSegmentsPerBlock);
+
+  std::vector<int32_t> block_token_offsets_host(num_moe_blocks + 1);
+  std::vector<int32_t> expert_ids_host(num_moe_blocks, -1);
+  std::vector<int32_t> block_num_segments_host(num_moe_blocks, 0);
+  std::vector<int32_t> block_segment_experts_host(
+      num_moe_blocks * kMaxSegmentsPerBlock, -1);
+  std::vector<int32_t> block_segment_row_starts_host(
+      num_moe_blocks * kMaxSegmentsPerBlock, 0);
+  std::vector<int32_t> block_segment_counts_host(
+      num_moe_blocks * kMaxSegmentsPerBlock, 0);
+
+  int32_t dense_offset = 0;
+  for (int32_t b = 0; b < num_moe_blocks; ++b) {
+    const PackedMoeBlock& block = blocks[b];
+    block_token_offsets_host[b] = dense_offset;
+    expert_ids_host[b] = block.first_expert;
+    block_num_segments_host[b] = block.num_segments;
+    for (int32_t s = 0; s < block.num_segments; ++s) {
+      const int32_t flat = b * kMaxSegmentsPerBlock + s;
+      block_segment_experts_host[flat] = block.segment_experts[s];
+      block_segment_row_starts_host[flat] = block.segment_row_starts[s];
+      block_segment_counts_host[flat] = block.segment_counts[s];
+    }
+    dense_offset += block.token_count;
+  }
+  block_token_offsets_host[num_moe_blocks] = dense_offset;
+
+  cudaMemcpyAsync(expert_offsets.data_ptr<int32_t>(), dense_cumsum.data(),
+                  dense_cumsum.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  stream);
+  sorted_token_ids.fill_(static_cast<int32_t>(numel));
+
+  VLLM_DISPATCH_INTEGRAL_AND_UNSIGNED_TYPES(
+      topk_ids.scalar_type(), "sort_expert_tokens_dense_kernel", [&] {
+        sort_expert_tokens_dense_kernel<scalar_t>
+            <<<count_blocks, block_threads, 0, stream>>>(
+                topk_ids.data_ptr<scalar_t>(),
+                sorted_token_ids.data_ptr<int32_t>(),
+                write_cursor.data_ptr<int32_t>(),
+                expert_offsets.data_ptr<int32_t>(),
+                expert_map.data_ptr<int32_t>(), num_experts_i, numel,
+                has_expert_map);
+      });
+
+  const int32_t num_tokens_post_pad_host = num_tokens_post_pad_val;
+  cudaMemcpyAsync(num_tokens_post_pad.data_ptr<int32_t>(),
+                  &num_tokens_post_pad_host, sizeof(int32_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(block_token_offsets.data_ptr<int32_t>(),
+                  block_token_offsets_host.data(),
+                  (num_moe_blocks + 1) * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  stream);
+  cudaMemcpyAsync(expert_ids.data_ptr<int32_t>(), expert_ids_host.data(),
+                  num_moe_blocks * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  stream);
+  cudaMemcpyAsync(block_num_segments.data_ptr<int32_t>(),
+                  block_num_segments_host.data(),
+                  num_moe_blocks * sizeof(int32_t), cudaMemcpyHostToDevice,
+                  stream);
+  cudaMemcpyAsync(block_segment_experts.data_ptr<int32_t>(),
+                  block_segment_experts_host.data(),
+                  num_moe_blocks * kMaxSegmentsPerBlock * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(block_segment_row_starts.data_ptr<int32_t>(),
+                  block_segment_row_starts_host.data(),
+                  num_moe_blocks * kMaxSegmentsPerBlock * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, stream);
+  cudaMemcpyAsync(block_segment_counts.data_ptr<int32_t>(),
+                  block_segment_counts_host.data(),
+                  num_moe_blocks * kMaxSegmentsPerBlock * sizeof(int32_t),
+                  cudaMemcpyHostToDevice, stream);
 }

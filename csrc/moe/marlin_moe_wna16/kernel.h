@@ -21,7 +21,12 @@
       const float *__restrict__ topk_weights_ptr, int top_k,          \
       bool mul_topk_weights, int num_groups, int prob_m, int prob_n,  \
       int prob_k, int *locks, bool has_bias, bool use_atomic_add,     \
-      bool use_fp32_reduce
+      bool use_fp32_reduce,                                           \
+      const int32_t *__restrict__ block_token_offsets_ptr,            \
+      const int32_t *__restrict__ block_num_segments_ptr,             \
+      const int32_t *__restrict__ block_segment_experts_ptr,            \
+      const int32_t *__restrict__ block_segment_row_starts_ptr,       \
+      const int32_t *__restrict__ block_segment_counts_ptr
 
 namespace MARLIN_NAMESPACE_NAME {
 template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id

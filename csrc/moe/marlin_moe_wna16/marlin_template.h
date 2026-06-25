@@ -78,7 +78,12 @@ __global__ void Marlin(
     int prob_k,             // reduction dimension k
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,    // whether to use atomic add to reduce
-    bool use_fp32_reduce    // whether to use fp32 global reduce
+    bool use_fp32_reduce,   // whether to use fp32 global reduce
+    const int32_t* __restrict__ block_token_offsets_ptr,
+    const int32_t* __restrict__ block_num_segments_ptr,
+    const int32_t* __restrict__ block_segment_experts_ptr,
+    const int32_t* __restrict__ block_segment_row_starts_ptr,
+    const int32_t* __restrict__ block_segment_counts_ptr
 ) {}
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -280,7 +285,12 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
-    bool use_fp32_reduce  // whether to use fp32 global reduce
+    bool use_fp32_reduce,  // whether to use fp32 global reduce
+    const int32_t* __restrict__ block_token_offsets_ptr,
+    const int32_t* __restrict__ block_num_segments_ptr,
+    const int32_t* __restrict__ block_segment_experts_ptr,
+    const int32_t* __restrict__ block_segment_row_starts_ptr,
+    const int32_t* __restrict__ block_segment_counts_ptr
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -307,6 +317,8 @@ __global__ void Marlin(
 
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   constexpr int moe_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
+  constexpr int max_block_segments = 16;
+  const bool use_packed_moe = block_token_offsets_ptr != nullptr;
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   static constexpr auto num_bits =
@@ -453,6 +465,8 @@ __global__ void Marlin(
       reinterpret_cast<c_scalar_t2*>(sh_block_topk_weights_int4);
 
   int32_t block_num_valid_tokens = 0;
+  int32_t block_segment_idx = 0;
+  int32_t block_num_segments = 1;
   int32_t locks_off = 0;
 
   // We can easily implement parallel problem execution by just remapping
@@ -468,20 +482,84 @@ __global__ void Marlin(
   int prob_m_top_k = prob_m * top_k;
   // read moe block data given block_id
   // block_sorted_ids / block_num_valid_tokens / block_topk_weights
-  auto read_moe_block_data = [&](int block_id) {
-    block_num_valid_tokens = moe_block_size;
+  auto apply_block_segment = [&]() {
+    if (!use_packed_moe || block_num_segments <= 1) {
+      return;
+    }
+    const int flat = block_id * max_block_segments + block_segment_idx;
+    old_expert_id = expert_id;
+    expert_id = block_segment_experts_ptr[flat];
+    const int row_start = block_segment_row_starts_ptr[flat];
+    block_num_valid_tokens = block_segment_counts_ptr[flat];
 
-    cp_async4_pred(sh_block_sorted_ids_int4 + threadIdx.x,
-                   reinterpret_cast<const int4*>(sorted_token_ids_ptr) +
-                       (block_id * moe_block_size / 4 + threadIdx.x),
-                   threadIdx.x < moe_block_size / 4);
+    if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+      global_scale_f32 = global_scale_ptr[expert_id];
+    }
 
-    cp_async_fence();
-    cp_async_wait<0>();
+    B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
+    scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+    if constexpr (has_zp) {
+      zp_ptr += (expert_id - old_expert_id) * zp_expert_stride;
+    }
+    if constexpr (has_act_order) {
+      g_idx += (expert_id - old_expert_id) * prob_k;
+    }
+    if (has_bias) {
+      b_bias_ptr += (expert_id - old_expert_id) * b_bias_expert_stride;
+    }
 
+    if (threadIdx.x < moe_block_size) {
+      int src_row = row_start + threadIdx.x;
+      int idx = src_row < row_start + block_num_valid_tokens
+                    ? sh_block_sorted_ids[src_row]
+                    : prob_m * top_k;
+      sh_rd_block_sorted_ids[threadIdx.x] = idx / top_k;
+
+      if (mul_topk_weights) {
+        idx = idx < prob_m * top_k ? idx : 0;
+        float topk_weight_tmp = topk_weights_ptr[idx];
+        if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+          topk_weight_tmp *= global_scale_f32;
+        }
+        c_scalar_t2 topk_weight_val =
+            Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
+        sh_block_topk_weights[threadIdx.x] = topk_weight_val;
+      }
+    }
     __syncthreads();
+  };
 
-    if (threadIdx.x >= threads - 32) {
+  auto read_moe_block_data = [&](int block_id) {
+    const int token_base =
+        use_packed_moe ? block_token_offsets_ptr[block_id]
+                       : block_id * moe_block_size;
+    block_num_valid_tokens = moe_block_size;
+    block_segment_idx = 0;
+
+    if (use_packed_moe) {
+      block_num_valid_tokens =
+          block_token_offsets_ptr[block_id + 1] - token_base;
+      block_num_segments = block_num_segments_ptr[block_id];
+      if (threadIdx.x < moe_block_size) {
+        const int src = token_base + threadIdx.x;
+        sh_block_sorted_ids[threadIdx.x] =
+            threadIdx.x < block_num_valid_tokens ? sorted_token_ids_ptr[src]
+                                                 : prob_m_top_k;
+      }
+      __syncthreads();
+    } else {
+      cp_async4_pred(sh_block_sorted_ids_int4 + threadIdx.x,
+                     reinterpret_cast<const int4*>(sorted_token_ids_ptr) +
+                         (token_base / 4 + threadIdx.x),
+                     threadIdx.x < moe_block_size / 4);
+
+      cp_async_fence();
+      cp_async_wait<0>();
+
+      __syncthreads();
+    }
+
+    if (!use_packed_moe && threadIdx.x >= threads - 32) {
       constexpr int size_per_thread = div_ceil(moe_block_size, 32);
       int lane_id = threadIdx.x - (threads - 32);
 
@@ -507,16 +585,21 @@ __global__ void Marlin(
         local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 2);
 
       local_count += __shfl_down_sync(0xFFFFFFFF, local_count, 1);
-      block_num_valid_tokens = local_count;
+      if (!use_packed_moe) {
+        block_num_valid_tokens = local_count;
+      }
   #else
-      block_num_valid_tokens = __reduce_add_sync(0xffffffff, local_count);
+      if (!use_packed_moe) {
+        block_num_valid_tokens = __reduce_add_sync(0xffffffff, local_count);
+      }
   #endif
 
       if (lane_id == 0)
         reinterpret_cast<int*>(sh_new)[0] = block_num_valid_tokens;
     }
 
-    if (threadIdx.x < moe_block_size) {
+    if (!(use_packed_moe && block_num_segments > 1) &&
+        threadIdx.x < moe_block_size) {
       int idx = sh_block_sorted_ids[threadIdx.x];
       sh_rd_block_sorted_ids[threadIdx.x] = idx / top_k;
 
@@ -534,8 +617,14 @@ __global__ void Marlin(
 
     __syncthreads();
 
-    block_num_valid_tokens = reinterpret_cast<int*>(sh_new)[0];
+    if (!use_packed_moe) {
+      block_num_valid_tokens = reinterpret_cast<int*>(sh_new)[0];
+    }
     __syncthreads();
+
+    if (use_packed_moe && block_num_segments > 1) {
+      apply_block_segment();
+    }
   };
 
   // when move to next moe block, find the next block_id and expert_id
@@ -2237,25 +2326,26 @@ __global__ void Marlin(
       if (last || use_atomic_add)
         // only the last block in a slice actually writes the result
         write_result(last);
-      slice_row = 0;
-      if (!in_part2) {
-        slice_col_par += gridDim.x;
-      } else {
-        slice_col_par++;
-        slice_col++;
-      }
-      is_first_matmul_in_slice = true;
-      init_slice();
 
-      if (slice_iters) {
+      bool replay_block_segment = false;
+      if (use_packed_moe && block_num_segments > 1 &&
+          block_segment_idx + 1 < block_num_segments) {
+        ++block_segment_idx;
+        apply_block_segment();
+        replay_block_segment = true;
+      } else {
+        block_segment_idx = 0;
+      }
+
+      if (replay_block_segment) {
+        slice_row = 0;
+        slice_iters = k_tiles;
         a_gl_rd_col =
             a_gl_rd_delta_o * slice_row + threadIdx.x % a_gl_rd_delta_o;
         b_gl_rd = B_expert_off + b_gl_stride * (threadIdx.x / b_sh_stride) +
                   (threadIdx.x % b_sh_stride);
         b_gl_rd += b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
-
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
-        // Update slice k/n for scales loading
         if constexpr (has_act_order) {
           slice_k_start = tb_k * slice_row;
           slice_k_finish = slice_k_start + tb_k * slice_iters;
@@ -2284,6 +2374,55 @@ __global__ void Marlin(
           }
         }
         start_pipes();
+      } else {
+        slice_row = 0;
+        if (!in_part2) {
+          slice_col_par += gridDim.x;
+        } else {
+          slice_col_par++;
+          slice_col++;
+        }
+        is_first_matmul_in_slice = true;
+        init_slice();
+
+        if (slice_iters) {
+          a_gl_rd_col =
+              a_gl_rd_delta_o * slice_row + threadIdx.x % a_gl_rd_delta_o;
+          b_gl_rd = B_expert_off + b_gl_stride * (threadIdx.x / b_sh_stride) +
+                    (threadIdx.x % b_sh_stride);
+          b_gl_rd += b_sh_stride * slice_col + b_gl_rd_delta_o * slice_row;
+
+          bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
+          // Update slice k/n for scales loading
+          if constexpr (has_act_order) {
+            slice_k_start = tb_k * slice_row;
+            slice_k_finish = slice_k_start + tb_k * slice_iters;
+            slice_k_start_shared_fetch = slice_k_start;
+            slice_n_offset = act_s_col_tb_stride * slice_col;
+          } else {
+            if constexpr (group_blocks == -1) {
+              s_gl_rd = s_sh_stride * slice_col + threadIdx.x;
+              zp_gl_rd = zp_sh_stride * slice_col + threadIdx.x;
+            } else if constexpr (group_blocks >= thread_k_blocks) {
+              s_gl_rd =
+                  s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
+                  s_sh_stride * slice_col + threadIdx.x;
+              zp_gl_rd =
+                  zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks) +
+                  zp_sh_stride * slice_col + threadIdx.x;
+            } else {
+              s_gl_rd =
+                  s_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
+                                 threadIdx.x / s_sh_stride) +
+                  s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
+              zp_gl_rd =
+                  zp_gl_stride * ((thread_k_blocks * slice_row) / group_blocks +
+                                  threadIdx.x / zp_sh_stride) +
+                  zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
+            }
+          }
+          start_pipes();
+        }
       }
     }
   }

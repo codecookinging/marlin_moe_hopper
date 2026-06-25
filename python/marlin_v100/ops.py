@@ -62,6 +62,11 @@ def moe_align_block_size(*args, **kwargs) -> None:
     return torch.ops._moe_C.moe_align_block_size(*args, **kwargs)
 
 
+def moe_align_block_size_packed(*args, **kwargs) -> None:
+    _load_moe()
+    return torch.ops._moe_C.moe_align_block_size_packed(*args, **kwargs)
+
+
 def batched_moe_align_block_size(*args, **kwargs) -> None:
     _load_moe()
     return torch.ops._moe_C.batched_moe_align_block_size(*args, **kwargs)

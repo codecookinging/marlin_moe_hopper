@@ -47,7 +47,8 @@ __global__ void permute_cols_kernel(
     int4* __restrict__ out_int4_ptr,
     const int32_t* __restrict__ sorted_token_ids_ptr,
     const int32_t* __restrict__ expert_ids_ptr,
-    const int32_t* __restrict__ num_tokens_past_padded_ptr, int size_m,
+    const int32_t* __restrict__ num_tokens_past_padded_ptr,
+    const int32_t* __restrict__ block_token_offsets_ptr, int size_m,
     int size_k, int top_k) {
   int num_tokens_past_padded = num_tokens_past_padded_ptr[0];
   int num_moe_blocks = div_ceil(num_tokens_past_padded, moe_block_size);
@@ -59,16 +60,25 @@ __global__ void permute_cols_kernel(
 
   auto read_moe_block_data = [&](int block_id) {
     block_num_valid_tokens = moe_block_size;
+    const int token_base =
+        block_token_offsets_ptr != nullptr
+            ? block_token_offsets_ptr[block_id]
+            : block_id * moe_block_size;
     int4* tmp_block_sorted_ids = reinterpret_cast<int4*>(block_sorted_ids);
     for (int i = 0; i < moe_block_size / 4; i++) {
       tmp_block_sorted_ids[i] =
-          ((int4*)sorted_token_ids_ptr)[block_id * moe_block_size / 4 + i];
+          ((int4*)sorted_token_ids_ptr)[token_base / 4 + i];
     }
-    for (int i = 0; i < moe_block_size; i++) {
-      if (block_sorted_ids[i] >= size_m * top_k) {
-        block_num_valid_tokens = i;
-        break;
-      };
+    if (block_token_offsets_ptr != nullptr) {
+      block_num_valid_tokens =
+          block_token_offsets_ptr[block_id + 1] - token_base;
+    } else {
+      for (int i = 0; i < moe_block_size; i++) {
+        if (block_sorted_ids[i] >= size_m * top_k) {
+          block_num_valid_tokens = i;
+          break;
+        };
+      }
     }
   };
 
@@ -351,7 +361,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float) {
+               bool use_fp32_reduce, bool is_zp_float,
+               const int32_t* block_token_offsets_ptr,
+               const int32_t* block_num_segments_ptr,
+               const int32_t* block_segment_experts_ptr,
+               const int32_t* block_segment_row_starts_ptr,
+               const int32_t* block_segment_counts_ptr) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -419,7 +434,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     // clang-format off
     kernel<<<sms, default_threads, 0, stream>>>(
         A_ptr, perm_ptr, a_tmp_ptr, sorted_token_ids_ptr, expert_ids_ptr,
-        num_tokens_past_padded_ptr, prob_m, prob_k, top_k);
+        num_tokens_past_padded_ptr, block_token_offsets_ptr, prob_m, prob_k,
+        top_k);
     // clang-format on
     A_ptr = a_tmp_ptr;
     prob_m = prob_m * top_k;
@@ -554,7 +570,9 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+      block_token_offsets_ptr, block_num_segments_ptr, block_segment_experts_ptr,
+      block_segment_row_starts_ptr, block_segment_counts_ptr);
   // clang-format on
 }
 
@@ -575,7 +593,12 @@ torch::Tensor moe_wna16_marlin_gemm(
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm,
+    std::optional<torch::Tensor> block_token_offsets_or_none,
+    std::optional<torch::Tensor> block_num_segments_or_none,
+    std::optional<torch::Tensor> block_segment_experts_or_none,
+    std::optional<torch::Tensor> block_segment_row_starts_or_none,
+    std::optional<torch::Tensor> block_segment_counts_or_none) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -877,8 +900,9 @@ torch::Tensor moe_wna16_marlin_gemm(
               MARLIN_NAMESPACE_NAME::min_thread_n);
 
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int min_workspace_size = min(
-      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+  int parallel_padded =
+      num_tokens_past_padded.item<int>() / static_cast<int>(moe_block_size);
+  int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
@@ -895,6 +919,30 @@ torch::Tensor moe_wna16_marlin_gemm(
         "scalar type of a must be the same with c for 16 bit activation");
   }
 
+  const int32_t* block_token_offsets_ptr = nullptr;
+  const int32_t* block_num_segments_ptr = nullptr;
+  const int32_t* block_segment_experts_ptr = nullptr;
+  const int32_t* block_segment_row_starts_ptr = nullptr;
+  const int32_t* block_segment_counts_ptr = nullptr;
+  if (block_token_offsets_or_none.has_value() &&
+      block_token_offsets_or_none.value().defined() &&
+      block_token_offsets_or_none.value().numel() > 0) {
+    auto block_token_offsets = block_token_offsets_or_none.value();
+    TORCH_CHECK(block_num_segments_or_none.has_value());
+    TORCH_CHECK(block_segment_experts_or_none.has_value());
+    TORCH_CHECK(block_segment_row_starts_or_none.has_value());
+    TORCH_CHECK(block_segment_counts_or_none.has_value());
+    block_token_offsets_ptr = block_token_offsets.data_ptr<int32_t>();
+    block_num_segments_ptr =
+        block_num_segments_or_none.value().data_ptr<int32_t>();
+    block_segment_experts_ptr =
+        block_segment_experts_or_none.value().data_ptr<int32_t>();
+    block_segment_row_starts_ptr =
+        block_segment_row_starts_or_none.value().data_ptr<int32_t>();
+    block_segment_counts_ptr =
+        block_segment_counts_or_none.value().data_ptr<int32_t>();
+  }
+
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),
       b_bias.data_ptr(), a_scales.data_ptr(), b_scales.data_ptr(),
@@ -906,7 +954,9 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float);
+      is_zp_float, block_token_offsets_ptr, block_num_segments_ptr,
+      block_segment_experts_ptr, block_segment_row_starts_ptr,
+      block_segment_counts_ptr);
 
   return c;
 }
