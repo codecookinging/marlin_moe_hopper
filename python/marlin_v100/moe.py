@@ -160,7 +160,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     quant_type_id: int,
-    moe_block_size: int | None = None,
+    moe_block_size: 16,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -178,10 +178,10 @@ def fused_marlin_moe(
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
     num_experts = w1.shape[0]
-    if moe_block_size is None:
-        moe_block_size = select_moe_block_size(
-            m, topk, num_experts, hidden_states.dtype
-        )
+    
+    moe_block_size = select_moe_block_size(
+        m, topk, num_experts, hidden_states.dtype
+    )
     intermediate_size = w1_scale.shape[2]
     n = intermediate_size // 2
     output_size = w2_scale.shape[2]
