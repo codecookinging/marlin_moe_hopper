@@ -64,13 +64,8 @@ def fused_marlin_moe(
         topk_ids, moe_block_size, w1.shape[0]
     )
     if workspace is None:
-        props = torch.cuda.get_device_properties(hidden_states.device)
-        max_blocks_per_sm = 6 if props.major >= 9 else 4
-        workspace = torch.zeros(
-            props.multi_processor_count * max_blocks_per_sm,
-            dtype=torch.int,
-            device=hidden_states.device,
-        )
+        sms = torch.cuda.get_device_properties(hidden_states.device).multi_processor_count
+        workspace = torch.zeros(sms * 4, dtype=torch.int, device=hidden_states.device)
 
     intermediate = torch.empty(
         (m * topk, intermediate_size),
