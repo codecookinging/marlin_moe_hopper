@@ -4,6 +4,26 @@ import torch
 
 from . import ops
 
+_MOE_BLOCK_SIZE_CANDIDATES = (8, 16, 32, 48, 64)
+
+
+def select_moe_block_size(
+    m: int,
+    topk: int,
+    num_experts: int,
+    input_dtype: torch.dtype | None = None,
+) -> int:
+    """Pick MoE M-tile size from token/expert load (matches vLLM heuristic)."""
+    if num_experts <= 0:
+        raise ValueError(f"num_experts must be positive, got {num_experts}")
+    block_size_m = _MOE_BLOCK_SIZE_CANDIDATES[-1]
+    for candidate in _MOE_BLOCK_SIZE_CANDIDATES:
+        if m * topk / num_experts / candidate < 0.9:
+            block_size_m = candidate
+            break
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
 
 def moe_align_block_size(
     topk_ids: torch.Tensor,
@@ -37,7 +57,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     quant_type_id: int,
-    moe_block_size: int,
+    moe_block_size: int, 
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -56,6 +76,12 @@ def fused_marlin_moe(
     intermediate_size = w1_scale.shape[2]
     n = intermediate_size // 2
     output_size = w2_scale.shape[2]
+    num_experts = w1.shape[0]
+    if moe_block_size is None:
+        moe_block_size = select_moe_block_size(
+            m, topk, num_experts, hidden_states.dtype
+        )
+
     if intermediate_size % 2 != 0:
         raise ValueError(
             f"Expected first-layer MoE scale width to be even, got {intermediate_size}."
