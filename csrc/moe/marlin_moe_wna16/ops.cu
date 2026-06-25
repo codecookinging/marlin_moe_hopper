@@ -942,6 +942,9 @@ torch::Tensor moe_wna16_marlin_gemm(
     block_segment_counts_ptr =
         block_segment_counts_or_none.value().data_ptr<int32_t>();
   }
+  if (block_token_offsets_ptr != nullptr) {
+    use_atomic_add = false;
+  }
 
   MARLIN_NAMESPACE_NAME::marlin_mm(
       a.data_ptr(), b_q_weight.data_ptr(), c.data_ptr(), c_tmp.data_ptr(),

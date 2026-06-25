@@ -508,22 +508,24 @@ __global__ void Marlin(
       b_bias_ptr += (expert_id - old_expert_id) * b_bias_expert_stride;
     }
 
-    if (threadIdx.x < moe_block_size) {
-      int src_row = row_start + threadIdx.x;
-      int idx = src_row < row_start + block_num_valid_tokens
-                    ? sh_block_sorted_ids[src_row]
-                    : prob_m * top_k;
-      sh_rd_block_sorted_ids[threadIdx.x] = idx / top_k;
+    if (threadIdx.x == 0) {
+      // Compact the active segment to row 0. Source and destination ranges can
+      // overlap, so keep this serial for correctness; moe_block_size is small.
+      for (int row = 0; row < block_num_valid_tokens; ++row) {
+        int idx = sh_block_sorted_ids[row_start + row];
+        sh_block_sorted_ids[row] = idx;
+        sh_rd_block_sorted_ids[row] = idx / top_k;
 
-      if (mul_topk_weights) {
-        idx = idx < prob_m * top_k ? idx : 0;
-        float topk_weight_tmp = topk_weights_ptr[idx];
-        if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
-          topk_weight_tmp *= global_scale_f32;
+        if (mul_topk_weights) {
+          int weight_idx = idx < prob_m * top_k ? idx : 0;
+          float topk_weight_tmp = topk_weights_ptr[weight_idx];
+          if constexpr (b_type == vllm::kFE2M1f && s_type == vllm::kFE4M3fn) {
+            topk_weight_tmp *= global_scale_f32;
+          }
+          c_scalar_t2 topk_weight_val =
+              Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
+          sh_block_topk_weights[row] = topk_weight_val;
         }
-        c_scalar_t2 topk_weight_val =
-            Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
-        sh_block_topk_weights[threadIdx.x] = topk_weight_val;
       }
     }
     __syncthreads();
@@ -2340,6 +2342,7 @@ __global__ void Marlin(
       if (replay_block_segment) {
         slice_row = 0;
         slice_iters = k_tiles;
+        is_first_matmul_in_slice = true;
         a_gl_rd_col =
             a_gl_rd_delta_o * slice_row + threadIdx.x % a_gl_rd_delta_o;
         b_gl_rd = B_expert_off + b_gl_stride * (threadIdx.x / b_sh_stride) +

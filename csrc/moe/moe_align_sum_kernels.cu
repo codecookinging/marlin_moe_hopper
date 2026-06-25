@@ -908,7 +908,7 @@ void moe_align_block_size_packed(
   auto options_int = sorted_token_ids.options();
   torch::Tensor expert_counts = torch::zeros({num_experts_i}, options_int);
   torch::Tensor write_cursor = torch::zeros({num_experts_i}, options_int);
-  torch::Tensor expert_offsets = torch::empty({num_experts_i}, options_int);
+  torch::Tensor expert_offsets = torch::empty({num_experts_i + 1}, options_int);
 
   const int block_threads = 256;
   const int count_blocks =
