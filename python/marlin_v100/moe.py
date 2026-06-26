@@ -57,7 +57,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     quant_type_id: int,
-    moe_block_size: int, 
+    moe_block_size: int | None = None,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
