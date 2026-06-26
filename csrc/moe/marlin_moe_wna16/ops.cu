@@ -178,6 +178,8 @@ struct ClusterLaunchPlan {
   int physical_blocks = 0;
   int cluster_size = 1;
   int max_batch_size = 1;
+  int max_group_size = 1;
+  bool has_partial_batch = false;
   std::vector<int> phys_to_logical;
 };
 
@@ -204,10 +206,14 @@ ClusterLaunchPlan build_cluster_launch_plan(int logical_blocks, int cluster_size
     while (end < logical_blocks && (iters * end) / k_tiles == group_key) {
       ++end;
     }
+    plan.max_group_size = std::max(plan.max_group_size, end - b);
     int pos = b;
     while (pos < end) {
       const int batch_size = std::min(cluster_size, end - pos);
       plan.max_batch_size = std::max(plan.max_batch_size, batch_size);
+      if (batch_size != cluster_size) {
+        plan.has_partial_batch = true;
+      }
       const int batch_high = end - 1 - (pos - b);
       for (int rank = 0; rank < batch_size; ++rank) {
         plan.phys_to_logical.push_back(batch_high - rank);
@@ -655,8 +661,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     ClusterLaunchPlan plan = build_cluster_launch_plan(
         logical_blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
 
-    if (sk.part2_mn_tiles >= logical_blocks || plan.max_batch_size <= 1) {
+    if (sk.part2_mn_tiles >= logical_blocks || plan.max_batch_size <= 1 ||
+        plan.has_partial_batch || plan.max_group_size != cluster_size) {
       use_cluster_reduce = false;
+      use_atomic_add = true;
+      use_fp32_reduce = false;
       cluster_size = 1;
       cluster_cta_map_dev = nullptr;
       cluster_cta_map_ptr = nullptr;
@@ -868,7 +877,9 @@ torch::Tensor moe_wna16_marlin_gemm(
   // path. This keeps the Stream-K tail from paying a full FP32 temp-buffer
   // reduction unless explicitly requested for debugging/accuracy checks.
   const char* force_lock_reduce_env = std::getenv("MARLIN_MOE_FORCE_LOCK_REDUCE");
-  if (!(force_lock_reduce_env != nullptr && force_lock_reduce_env[0] == '1')) {
+  bool force_lock_reduce =
+      force_lock_reduce_env != nullptr && force_lock_reduce_env[0] == '1';
+  if (!force_lock_reduce) {
     use_atomic_add = true;
   }
 
@@ -881,7 +892,9 @@ torch::Tensor moe_wna16_marlin_gemm(
   const char* cluster_reduce_env = std::getenv("MARLIN_MOE_USE_CLUSTER_REDUCE");
   if (cluster_reduce_env != nullptr && cluster_reduce_env[0] == '1') {
     use_cluster_reduce = true;
-    use_atomic_add = false;
+    if (!force_lock_reduce) {
+      use_atomic_add = false;
+    }
   }
 
   // Alloc C tmp buffer that is going to be used for the global reduce
@@ -1042,6 +1055,9 @@ torch::Tensor moe_wna16_marlin_gemm(
                          dev);
   if (!use_cluster_reduce || major_capability < 9) {
     use_cluster_reduce = false;
+    if (!force_lock_reduce) {
+      use_atomic_add = true;
+    }
   }
   if (use_cluster_reduce) {
     int max_logical_blocks = sms * (int)blocks_per_sm;

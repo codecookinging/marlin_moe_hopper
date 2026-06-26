@@ -2236,49 +2236,10 @@ __global__ void Marlin(
         marlin_hopper::ClusterReduceStatus cluster_status =
             marlin_hopper::cluster_streamk_reduce(
                 reinterpret_cast<float*>(&frag_c), cluster_num_floats, sh_red,
-                slice_col_par, slice_idx, slice_count);
+                slice_idx, slice_count);
         if (cluster_status.ok) {
           cluster_reduced = true;
-          if (cluster_status.merge_batches) {
-            cooperative_groups::cluster_group cluster =
-                cooperative_groups::this_cluster();
-            const int cluster_size = cluster.num_blocks();
-            const int batch_id = slice_idx / cluster_size;
-            const int local_slice_idx = slice_idx - batch_id * cluster_size;
-            const int num_batches =
-                (slice_count + cluster_size - 1) / cluster_size;
-            if (local_slice_idx == 0) {
-              if (batch_id == 0) {
-                constexpr int threads_per_m = 16 * thread_n_blocks / 8;
-                int m_per_thread = div_ceil(block_num_valid_tokens,
-                                            threads / threads_per_m);
-                for (int i = 0; i < m_per_thread; i++) {
-                  int row =
-                      threads / threads_per_m * i + threadIdx.x / threads_per_m;
-                  if (row < block_num_valid_tokens) {
-                    int64_t sorted_row = sh_block_sorted_ids[row];
-                    int col = slice_col * 16 * thread_n_blocks / 8 +
-                              threadIdx.x % threads_per_m;
-                    C[sorted_row * prob_n / 8 + col] = {0, 0, 0, 0};
-                  }
-                }
-                __syncthreads();
-                if (threadIdx.x == 0) locks[locks_off] = 1 - num_batches;
-              } else {
-                wait_negative_and_add(&locks[locks_off]);
-              }
-              if (has_bias && batch_id == 0) {
-                cp_async_wait<0>();
-                __syncthreads();
-                reinterpret_cast<int4*>(&frag_bias)[0] = sh_bias[bias_sh_rd];
-                if constexpr (!is_a_8bit)
-                  reinterpret_cast<int4*>(&frag_bias)[1] =
-                      sh_bias[bias_sh_rd + 4];
-                __syncthreads();
-              }
-              write_result(true, true);
-            }
-          } else if (slice_idx == 0) {
+          if (slice_idx == 0) {
             if (has_bias) {
               cp_async_wait<0>();
               __syncthreads();
