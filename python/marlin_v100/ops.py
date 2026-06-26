@@ -74,4 +74,6 @@ def batched_moe_align_block_size(*args, **kwargs) -> None:
 
 def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     _load_moe()
+    if not kwargs and len(args) == 29:
+        args = (*args, None, None, None, None, None)
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)

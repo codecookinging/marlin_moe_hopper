@@ -59,11 +59,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
       "int thread_k, int thread_n, int blocks_per_sm,"
-      "Tensor? block_token_offsets_or_none,"
-      "Tensor? block_num_segments_or_none,"
-      "Tensor? block_segment_experts_or_none,"
-      "Tensor? block_segment_row_starts_or_none,"
-      "Tensor? block_segment_counts_or_none) -> Tensor");
+      "Tensor? block_token_offsets_or_none=None,"
+      "Tensor? block_num_segments_or_none=None,"
+      "Tensor? block_segment_experts_or_none=None,"
+      "Tensor? block_segment_row_starts_or_none=None,"
+      "Tensor? block_segment_counts_or_none=None) -> Tensor");
+  m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
 
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "

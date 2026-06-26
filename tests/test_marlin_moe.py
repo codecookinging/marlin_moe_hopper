@@ -530,4 +530,9 @@ def test_marlin_moe_rejects_unsupported_dtypes():
             -1,
             -1,
             -1,
+            None,
+            None,
+            None,
+            None,
+            None,
         )

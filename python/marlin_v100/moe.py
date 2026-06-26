@@ -160,7 +160,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     quant_type_id: int,
-    moe_block_size: 16,
+    moe_block_size: int = 16,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -201,14 +201,14 @@ def fused_marlin_moe(
             device=hidden_states.device,
         )
 
-    packed_kwargs = {}
+    packed_args = (None, None, None, None, None)
     if align.use_packed:
-        packed_kwargs = dict(
-            block_token_offsets_or_none=align.block_token_offsets,
-            block_num_segments_or_none=align.block_num_segments,
-            block_segment_experts_or_none=align.block_segment_experts,
-            block_segment_row_starts_or_none=align.block_segment_row_starts,
-            block_segment_counts_or_none=align.block_segment_counts,
+        packed_args = (
+            align.block_token_offsets,
+            align.block_num_segments,
+            align.block_segment_experts,
+            align.block_segment_row_starts,
+            align.block_segment_counts,
         )
 
     intermediate = torch.empty(
@@ -246,7 +246,7 @@ def fused_marlin_moe(
         -1,
         -1,
         -1,
-        **packed_kwargs,
+        *packed_args,
     )
     gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
@@ -283,6 +283,6 @@ def fused_marlin_moe(
         -1,
         -1,
         -1,
-        **packed_kwargs,
+        *packed_args,
     )
     return output.view(m, topk, output_size).sum(dim=1)
