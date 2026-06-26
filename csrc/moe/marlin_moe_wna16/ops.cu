@@ -577,12 +577,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
+  int logical_blocks = blocks;
 
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
   if (force_grid_env) {
     blocks = std::atoi(force_grid_env);
   }
+  logical_blocks = blocks;
   if (exec_cfg.blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
@@ -628,7 +630,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
 
   int cluster_size = 1;
   if (use_cluster_reduce) {
-    cluster_size = 8;
+    cluster_size = 2;
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
     cudaLaunchConfig_t occ_cfg{};
     occ_cfg.blockDim = num_threads;
@@ -637,18 +639,23 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) ==
             cudaSuccess &&
         max_cluster > 0) {
-      cluster_size = std::min(max_cluster, 8);
+      cluster_size = std::min(max_cluster, cluster_size);
     }
 #endif
 
+    if (cluster_size <= 1) {
+      use_cluster_reduce = false;
+    }
+  }
+  if (use_cluster_reduce) {
     int parallel_padded = num_tokens_past_padded_count / moe_block_size;
     StreamKHostParams sk = compute_streamk_host_params(
         parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
-        blocks);
+        logical_blocks);
     ClusterLaunchPlan plan = build_cluster_launch_plan(
-        blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
+        logical_blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
 
-    if (sk.part2_mn_tiles >= blocks) {
+    if (sk.part2_mn_tiles >= logical_blocks || plan.max_batch_size <= 1) {
       use_cluster_reduce = false;
       cluster_size = 1;
       cluster_cta_map_dev = nullptr;
@@ -686,15 +693,16 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         &config, kernel, A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr,
         b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr, sorted_token_ids_ptr,
         expert_ids_ptr, num_tokens_past_padded_ptr, topk_weights_ptr, top_k,
-        mul_topk_weights, num_groups, prob_m, prob_n, prob_k, cluster_cta_map_ptr,
-        locks, has_bias, use_atomic_add, use_fp32_reduce, use_cluster_reduce);
+        mul_topk_weights, num_groups, prob_m, prob_n, prob_k, logical_blocks,
+        cluster_cta_map_ptr, locks, has_bias, use_atomic_add, use_fp32_reduce,
+        use_cluster_reduce);
   } else {
     kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
         A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-        prob_n, prob_k, cluster_cta_map_ptr, locks, has_bias, use_atomic_add,
-        use_fp32_reduce, use_cluster_reduce);
+        prob_n, prob_k, logical_blocks, cluster_cta_map_ptr, locks, has_bias,
+        use_atomic_add, use_fp32_reduce, use_cluster_reduce);
   }
   // clang-format on
 }

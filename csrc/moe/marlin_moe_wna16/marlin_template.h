@@ -76,6 +76,7 @@ __global__ void Marlin(
     int prob_m,             // batch dimension m
     int prob_n,             // output dimension n
     int prob_k,             // reduction dimension k
+    int logical_blocks,     // logical Stream-K grid before cluster padding
     const int* __restrict__ cluster_cta_map,  // phys->logical CTA map (SM90)
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,       // whether to use atomic add to reduce
@@ -279,6 +280,7 @@ __global__ void Marlin(
     int prob_m,             // batch dimension m
     int prob_n,             // output dimension n
     int prob_k,             // reduction dimension k
+    int logical_blocks,     // logical Stream-K grid before cluster padding
     const int* __restrict__ cluster_cta_map,  // phys->logical CTA map (SM90)
     int* locks,             // extra global storage for barrier synchronization
     bool has_bias,
@@ -318,6 +320,7 @@ __global__ void Marlin(
     cta_block = cluster_cta_map[blockIdx.x];
     if (cta_block < 0) return;
   }
+  const int schedule_blocks = use_cluster_reduce ? logical_blocks : gridDim.x;
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   static constexpr auto num_bits =
@@ -413,13 +416,14 @@ __global__ void Marlin(
   // part1: DP
   // part2: two-tile SK
   // see https://github.com/vllm-project/vllm/pull/24722 for more details
-  if (global_mn_tiles > gridDim.x) {
-    part2_mn_tiles = global_mn_tiles % gridDim.x;
-    if (part2_mn_tiles * 3 <= gridDim.x) part2_mn_tiles += gridDim.x;
-    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / gridDim.x;
+  if (global_mn_tiles > schedule_blocks) {
+    part2_mn_tiles = global_mn_tiles % schedule_blocks;
+    if (part2_mn_tiles * 3 <= schedule_blocks)
+      part2_mn_tiles += schedule_blocks;
+    part1_mn_iters = (global_mn_tiles - part2_mn_tiles) / schedule_blocks;
   }
 
-  int iters = div_ceil(k_tiles * part2_mn_tiles, gridDim.x);
+  int iters = div_ceil(k_tiles * part2_mn_tiles, schedule_blocks);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -468,7 +472,7 @@ __global__ void Marlin(
 
   // We can easily implement parallel problem execution by just remapping
   // indices and advancing global pointers
-  if (part2_mn_tiles >= gridDim.x) {
+  if (part2_mn_tiles >= schedule_blocks) {
     // when part2_mn_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
     locks_off = cta_block;
@@ -601,7 +605,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (part2_mn_tiles >= gridDim.x) {
+    if (part2_mn_tiles >= schedule_blocks) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }
@@ -2320,7 +2324,7 @@ __global__ void Marlin(
       }
       slice_row = 0;
       if (!in_part2) {
-        slice_col_par += gridDim.x;
+        slice_col_par += schedule_blocks;
       } else {
         slice_col_par++;
         slice_col++;

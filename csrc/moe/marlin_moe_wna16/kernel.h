@@ -20,7 +20,8 @@
       const int32_t *__restrict__ num_tokens_past_padded_ptr,         \
       const float *__restrict__ topk_weights_ptr, int top_k,          \
       bool mul_topk_weights, int num_groups, int prob_m, int prob_n,  \
-      int prob_k, const int *__restrict__ cluster_cta_map, int *locks, \
+      int prob_k, int logical_blocks,                                 \
+      const int *__restrict__ cluster_cta_map, int *locks,            \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce,       \
       bool use_cluster_reduce
 
