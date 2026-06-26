@@ -393,10 +393,10 @@ __global__ void Marlin(
   int part2_mn_tiles = global_mn_tiles;
   int part1_mn_iters = 0;
   bool in_part2 = false;
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("[padded tokens %d] Marlin kernel launched with prob_m=%d, prob_n=%d, prob_k=%d, parallel=%d, k_tiles=%d, n_tiles=%d, thread_k_blocks=%d, thread_n_blocks=%d, moe_block_size=%d, gridDim.x=%d\n",
-          num_tokens_past_padded, prob_m, prob_n, prob_k, parallel, k_tiles, n_tiles, thread_k_blocks, thread_n_blocks, moe_block_size, gridDim.x);
-  }
+  // if (blockIdx.x == 0 && threadIdx.x == 0) {
+  //   printf("[padded tokens %d] Marlin kernel launched with prob_m=%d, prob_n=%d, prob_k=%d, parallel=%d, k_tiles=%d, n_tiles=%d, thread_k_blocks=%d, thread_n_blocks=%d, moe_block_size=%d, gridDim.x=%d\n",
+  //         num_tokens_past_padded, prob_m, prob_n, prob_k, parallel, k_tiles, n_tiles, thread_k_blocks, thread_n_blocks, moe_block_size, gridDim.x);
+  // }
 
   // we use DP + two-tile SK here
   // part1: DP

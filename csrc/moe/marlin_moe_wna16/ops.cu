@@ -493,6 +493,34 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     thread_tfg = exec_cfg.tb_cfg;
   }
 
+  // Runtime override for benchmarking precompiled large-batch thread-tile
+  // variants without rebuilding for every experiment.  The requested tuple
+  // still needs a generated template instantiation, otherwise get_marlin_kernel()
+  // will fail with the normal "Unsupported shapes" error below.
+  const char* force_large_thread_cfg_env =
+      std::getenv("MARLIN_MOE_FORCE_LARGE_THREAD_CONFIG");
+  if (thread_m_blocks > 1 && force_large_thread_cfg_env != nullptr &&
+      force_large_thread_cfg_env[0] != '\0') {
+    int forced_thread_k = -1;
+    int forced_thread_n = -1;
+    int forced_num_threads = -1;
+    int forced_blocks_per_sm = exec_cfg.blocks_per_sm;
+    int parsed = std::sscanf(force_large_thread_cfg_env, "%d,%d,%d,%d",
+                             &forced_thread_k, &forced_thread_n,
+                             &forced_num_threads, &forced_blocks_per_sm);
+    TORCH_CHECK(parsed == 3 || parsed == 4,
+                "MARLIN_MOE_FORCE_LARGE_THREAD_CONFIG must be "
+                "thread_k,thread_n,num_threads[,blocks_per_sm], got ",
+                force_large_thread_cfg_env);
+    TORCH_CHECK(forced_thread_k > 0 && forced_thread_n > 0 &&
+                    forced_num_threads > 0 && forced_blocks_per_sm > 0,
+                "Invalid MARLIN_MOE_FORCE_LARGE_THREAD_CONFIG=",
+                force_large_thread_cfg_env);
+    thread_tfg = thread_config_t{forced_thread_k, forced_thread_n,
+                                 forced_num_threads};
+    exec_cfg = exec_config_t{forced_blocks_per_sm, thread_tfg};
+  }
+
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
