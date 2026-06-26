@@ -2234,9 +2234,9 @@ __global__ void Marlin(
         constexpr int cluster_num_floats =
             thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
         marlin_hopper::ClusterReduceStatus cluster_status =
-            marlin_hopper::cluster_streamk_reduce(
-                reinterpret_cast<float*>(&frag_c), cluster_num_floats, sh_red,
-                slice_idx, slice_count);
+            marlin_hopper::cluster_streamk_reduce<cluster_num_floats>(
+                reinterpret_cast<float*>(&frag_c), sh_red, slice_idx,
+                slice_count);
         if (cluster_status.ok) {
           cluster_reduced = true;
           if (slice_idx == 0) {

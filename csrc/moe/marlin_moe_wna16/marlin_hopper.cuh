@@ -74,12 +74,13 @@ struct ClusterReduceStatus {
   bool ok = false;
 };
 
-__device__ inline ClusterReduceStatus cluster_streamk_reduce(
-    float* frag_c, int num_floats, int4* sh_red, int slice_idx,
-    int slice_count) {
+template <int NumFloats>
+__device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
+    float* frag_c, int4* sh_red, int slice_idx, int slice_count) {
   ClusterReduceStatus status;
   cg::cluster_group cluster = cg::this_cluster();
   const int cluster_size = cluster.num_blocks();
+  const int rank = cluster.block_rank();
 
   if (slice_count != 2 || cluster_size != 2 ||
       (slice_idx != 0 && slice_idx != 1)) {
@@ -87,19 +88,43 @@ __device__ inline ClusterReduceStatus cluster_streamk_reduce(
   }
 
   float* pack = reinterpret_cast<float*>(sh_red);
-  for (int i = threadIdx.x; i < num_floats; i += blockDim.x) {
-    pack[i] = frag_c[i];
+  constexpr int Vecs = NumFloats / 4;
+  constexpr int Tail = NumFloats - Vecs * 4;
+  if (slice_idx == 1) {
+    float4* pack4 = reinterpret_cast<float4*>(pack);
+    float4* frag4 = reinterpret_cast<float4*>(frag_c);
+    if (threadIdx.x < Vecs) {
+      pack4[threadIdx.x] = frag4[threadIdx.x];
+    }
+    if constexpr (Tail > 0) {
+      if (threadIdx.x < Tail) {
+        constexpr int TailBase = Vecs * 4;
+        pack[TailBase + threadIdx.x] = frag_c[TailBase + threadIdx.x];
+      }
+    }
   }
-  __syncthreads();
   cluster.sync();
 
   if (slice_idx == 0) {
-    float* peer_pack = cluster.map_shared_rank(pack, 1);
-    for (int i = threadIdx.x; i < num_floats; i += blockDim.x) {
-      frag_c[i] += peer_pack[i];
+    float* peer_pack = cluster.map_shared_rank(pack, 1 - rank);
+    float4* peer4 = reinterpret_cast<float4*>(peer_pack);
+    float4* frag4 = reinterpret_cast<float4*>(frag_c);
+    if (threadIdx.x < Vecs) {
+      float4 a = frag4[threadIdx.x];
+      float4 b = peer4[threadIdx.x];
+      a.x += b.x;
+      a.y += b.y;
+      a.z += b.z;
+      a.w += b.w;
+      frag4[threadIdx.x] = a;
+    }
+    if constexpr (Tail > 0) {
+      if (threadIdx.x < Tail) {
+        constexpr int TailBase = Vecs * 4;
+        frag_c[TailBase + threadIdx.x] += peer_pack[TailBase + threadIdx.x];
+      }
     }
   }
-  __syncthreads();
   cluster.sync();
 
   status.ok = true;
