@@ -64,7 +64,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor? block_segment_experts_or_none=None,"
       "Tensor? block_segment_row_starts_or_none=None,"
       "Tensor? block_segment_counts_or_none=None) -> Tensor");
-  m.impl("moe_wna16_marlin_gemm", torch::kCUDA, &moe_wna16_marlin_gemm);
 
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "
