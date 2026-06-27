@@ -72,12 +72,33 @@ def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)
 
 
-def _benchmark_schema_has_device_guard() -> bool:
+def _get_benchmark_op_schema():
+    """Resolve FunctionSchema for benchmark_streamk_reduce (OpOverload or OpOverloadPacket)."""
     op = torch.ops._moe_C.benchmark_streamk_reduce
+    schemas = getattr(op, "_schemas", None)
+    if schemas:
+        return next(iter(schemas.values()))
     schema = getattr(op, "_schema", None)
     if schema is not None:
+        return schema
+    if hasattr(op, "default"):
+        return op.default._schema
+    for name in op.overloads() if hasattr(op, "overloads") else []:
+        overload = getattr(op, name) if name else op.default
+        return overload._schema
+    return None
+
+
+def _benchmark_schema_text() -> str:
+    schema = _get_benchmark_op_schema()
+    return str(schema) if schema is not None else ""
+
+
+def _benchmark_schema_has_device_guard() -> bool:
+    schema = _get_benchmark_op_schema()
+    if schema is not None:
         return any(arg.name == "device_guard" for arg in schema.arguments)
-    return "device_guard" in str(getattr(op, "_schema", ""))
+    return "device_guard" in _benchmark_schema_text()
 
 
 def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
@@ -91,7 +112,7 @@ def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
         device_guard = torch.empty((), device="cuda")
         return op(device_guard, *args, **kwargs)
 
-    schema = str(getattr(op, "_schema", ""))
+    schema = _benchmark_schema_text()
     if args or kwargs:
         raise RuntimeError(
             "Loaded _moe_C is stale: benchmark_streamk_reduce schema is missing "

@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -21,17 +22,11 @@ from marlin_v100 import ops
 
 
 def _benchmark_schema_text() -> str:
-    op = torch.ops._moe_C.benchmark_streamk_reduce
-    schema = getattr(op, "_schema", None)
-    return str(schema) if schema is not None else ""
+    return ops._benchmark_schema_text()
 
 
 def _benchmark_has_device_guard() -> bool:
-    op = torch.ops._moe_C.benchmark_streamk_reduce
-    schema = getattr(op, "_schema", None)
-    if schema is not None:
-        return any(arg.name == "device_guard" for arg in schema.arguments)
-    return "device_guard" in _benchmark_schema_text()
+    return ops._benchmark_schema_has_device_guard()
 
 
 def _moe_extension_path() -> str:
@@ -41,6 +36,24 @@ def _moe_extension_path() -> str:
         return str(getattr(moe_ext, "__file__", "<unknown>"))
     except Exception as exc:  # pragma: no cover
         return f"<unavailable: {exc}>"
+
+
+def _extension_project_root() -> str:
+    ext_path = _moe_extension_path()
+    if ext_path.startswith("<"):
+        return "<unknown>"
+    # .../python/marlin_v100/_moe_C*.so -> repo root is three levels up
+    return str(Path(ext_path).resolve().parents[2])
+
+
+def _bindings_source_has_device_guard() -> bool | None:
+    root = _extension_project_root()
+    if root == "<unknown>":
+        return None
+    bindings = Path(root) / "csrc/moe/torch_bindings_marlin.cpp"
+    if not bindings.is_file():
+        return None
+    return "device_guard" in bindings.read_text(encoding="utf-8")
 
 
 def _benchmark_environment() -> tuple[bool, str]:
@@ -57,14 +70,41 @@ def _benchmark_environment() -> tuple[bool, str]:
         torch.ops._moe_C, "benchmark_streamk_reduce"
     ):
         return False, "benchmark_streamk_reduce is not registered in _moe_C"
-    if not _benchmark_has_device_guard():
-        return (
-            False,
-            "stale _moe_C schema (missing device_guard Tensor argument); "
-            f"loaded from {_moe_extension_path()}; schema={_benchmark_schema_text()!r}; "
-            "rebuild with: PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace",
+
+    ext_path = _moe_extension_path()
+    project_root = _extension_project_root()
+    schema = _benchmark_schema_text()
+    if _benchmark_has_device_guard():
+        return True, ""
+
+    src_ok = _bindings_source_has_device_guard()
+    rebuild_cmd = (
+        f"cd {project_root} && "
+        "rm -rf build python/marlin_v100/_moe_C*.so && "
+        "PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace"
+    )
+    if src_ok is True:
+        reason = (
+            "loaded _moe_C binary is stale even though source already contains "
+            "device_guard; rebuild in the directory that owns the loaded .so"
         )
-    return True, ""
+    elif src_ok is False:
+        reason = (
+            "loaded project copy is stale: csrc/moe/torch_bindings_marlin.cpp "
+            "in the loaded tree still lacks device_guard (sync/copy issue)"
+        )
+    else:
+        reason = "loaded _moe_C binary is stale relative to benchmark source"
+
+    return (
+        False,
+        f"{reason}\n"
+        f"  loaded _moe_C: {ext_path}\n"
+        f"  project root:  {project_root}\n"
+        f"  schema:        {schema!r}\n"
+        f"  rebuild:\n"
+        f"    {rebuild_cmd}",
+    )
 
 
 def _require_sm90_benchmark(*, fail_instead_of_skip: bool = False) -> None:
