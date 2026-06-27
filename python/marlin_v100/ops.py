@@ -70,3 +70,8 @@ def batched_moe_align_block_size(*args, **kwargs) -> None:
 def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     _load_moe()
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)
+
+
+def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.benchmark_streamk_reduce(*args, **kwargs)

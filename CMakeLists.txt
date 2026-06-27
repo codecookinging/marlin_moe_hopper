@@ -136,7 +136,8 @@ set(MARLIN_V100_MOE_SRC
   "csrc/moe/torch_bindings_marlin.cpp"
   "csrc/moe/moe_align_sum_kernels.cu"
   "csrc/moe/topk_softmax_kernels.cu"
-  "csrc/moe/grouped_topk_kernels.cu")
+  "csrc/moe/grouped_topk_kernels.cu"
+  "csrc/moe/cluster_reduce_benchmark.cu")
 marlin_configure_cuda_sources(
   SRCS "${MARLIN_V100_MOE_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}")

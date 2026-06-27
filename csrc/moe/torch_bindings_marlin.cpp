@@ -47,6 +47,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
 
   m.def(
+      "benchmark_streamk_reduce(int num_floats, int num_threads, int num_pairs,"
+      " int warmup_iters, int bench_iters, bool run_verify) -> Tensor");
+
+  m.def(
       "grouped_topk(Tensor scores, int n_group, int "
       "topk_group, int topk, bool renormalize, float "
       "routed_scaling_factor, Tensor bias, int scoring_func) -> (Tensor, "
