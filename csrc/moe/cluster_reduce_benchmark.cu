@@ -6,6 +6,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
 #include <torch/all.h>
 
 #include <cooperative_groups.h>
@@ -151,9 +152,7 @@ void launch_atomic_bench(float* output, const float* partials, int* locks,
 template <int NumFloats, int NumThreads>
 void launch_cluster_bench(float* output, const float* partials, int num_pairs,
                           int iters, cudaStream_t stream) {
-  using ClusterKernelFn =
-      decltype(cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>);
-  ClusterKernelFn kernel = cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>;
+  auto* kernel = &cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>;
 
   const int cluster_size = 2;
   const int blocks = num_pairs * cluster_size;
@@ -173,10 +172,17 @@ void launch_cluster_bench(float* output, const float* partials, int num_pairs,
   config.attrs = &attr;
   config.numAttrs = 1;
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      (cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>),
+      cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+  C10_CUDA_CHECK(cudaFuncSetAttribute(
+      (cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>),
+      cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+#endif
 
-  cudaLaunchKernelEx(&config, kernel, output, partials, num_pairs, iters);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(
+      &config, kernel, output, partials, num_pairs, iters));
 }
 
 template <typename LaunchFn>
@@ -250,8 +256,7 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
   const double cluster_ns =
       time_kernel(launch_cluster, warmup_iters, bench_iters, stream);
 
-  TORCH_CHECK(cudaGetLastError() == cudaSuccess,
-              "CUDA error after streamk reduce benchmark");
+  C10_CUDA_CHECK(cudaGetLastError());
 
   // [num_floats, num_threads, atomic_ns_per_pair, cluster_ns_per_pair,
   //  max_abs_diff, num_pairs, atomic_ns_per_launch]
