@@ -74,4 +74,8 @@ def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
 
 def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
     _load_moe()
-    return torch.ops._moe_C.benchmark_streamk_reduce(*args, **kwargs)
+    if (args and isinstance(args[0], torch.Tensor)) or kwargs.get("device_guard") is not None:
+        return torch.ops._moe_C.benchmark_streamk_reduce(*args, **kwargs)
+    # PyTorch dispatches to CUDA only when a Tensor argument is present.
+    device_guard = torch.empty((), device="cuda")
+    return torch.ops._moe_C.benchmark_streamk_reduce(device_guard, *args, **kwargs)

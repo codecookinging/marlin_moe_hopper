@@ -47,8 +47,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
 
   m.def(
-      "benchmark_streamk_reduce(int num_floats, int num_threads, int num_pairs,"
-      " int warmup_iters, int bench_iters, bool run_verify) -> Tensor");
+      "benchmark_streamk_reduce(Tensor device_guard, int num_floats, int num_threads,"
+      " int num_pairs, int warmup_iters, int bench_iters, bool run_verify)"
+      " -> Tensor");
   m.impl("benchmark_streamk_reduce", torch::kCUDA, &benchmark_streamk_reduce);
 
   m.def(

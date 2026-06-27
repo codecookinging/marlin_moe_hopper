@@ -318,11 +318,14 @@ int device_major_capability(at::Device device) {
 
 }  // namespace
 
-at::Tensor benchmark_streamk_reduce(int64_t num_floats, int64_t num_threads,
+at::Tensor benchmark_streamk_reduce(const at::Tensor& device_guard,
+                                    int64_t num_floats, int64_t num_threads,
                                     int64_t num_pairs, int64_t warmup_iters,
                                     int64_t bench_iters, bool run_verify) {
+  TORCH_CHECK(device_guard.is_cuda(),
+              "benchmark_streamk_reduce requires a CUDA device_guard tensor");
   TORCH_CHECK(torch::cuda::is_available(), "CUDA is required");
-  at::Device device(torch::kCUDA);
+  at::Device device = device_guard.device();
 
   TORCH_CHECK(num_pairs > 0, "num_pairs must be positive");
   TORCH_CHECK(warmup_iters >= 0, "warmup_iters must be non-negative");
