@@ -49,6 +49,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
   m.def(
       "benchmark_streamk_reduce(int num_floats, int num_threads, int num_pairs,"
       " int warmup_iters, int bench_iters, bool run_verify) -> Tensor");
+  m.impl("benchmark_streamk_reduce", torch::kCUDA, &benchmark_streamk_reduce);
 
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "

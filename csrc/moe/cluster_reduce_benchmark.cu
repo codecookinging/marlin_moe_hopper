@@ -12,7 +12,6 @@
 #include <cooperative_groups.h>
 #include <vector>
 
-#include "core/registration.h"
 #include "moe/marlin_moe_wna16/marlin_hopper.cuh"
 
 namespace {
@@ -231,15 +230,6 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
     launch_atomic_bench<NumFloats, NumThreads>(
         out_atomic_ptr, partials_ptr, locks_ptr, num_pairs, iters, stream);
   };
-
-  if (run_verify) {
-    launch_atomic(1);
-    cudaStreamSynchronize(stream);
-  }
-
-  const double atomic_ns = time_kernel(launch_atomic, warmup_iters, bench_iters,
-                                       stream);
-
   auto launch_cluster = [&](int iters) {
     launch_cluster_bench<NumFloats, NumThreads>(
         out_cluster_ptr, partials_ptr, num_pairs, iters, stream);
@@ -247,11 +237,23 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
 
   double max_abs_diff = 0.0;
   if (run_verify) {
+    output_atomic.zero_();
+    output_cluster.zero_();
+    locks.zero_();
+    launch_atomic(1);
+    cudaStreamSynchronize(stream);
     launch_cluster(1);
     cudaStreamSynchronize(stream);
     max_abs_diff =
         (output_cluster - output_atomic).abs().max().item<double>();
+
+    output_atomic.zero_();
+    output_cluster.zero_();
+    locks.zero_();
   }
+
+  const double atomic_ns = time_kernel(launch_atomic, warmup_iters, bench_iters,
+                                       stream);
 
   const double cluster_ns =
       time_kernel(launch_cluster, warmup_iters, bench_iters, stream);
@@ -337,8 +339,4 @@ at::Tensor benchmark_streamk_reduce(int64_t num_floats, int64_t num_threads,
                          static_cast<int>(num_pairs),
                          static_cast<int>(warmup_iters),
                          static_cast<int>(bench_iters), run_verify, device);
-}
-
-TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {
-  m.impl("benchmark_streamk_reduce", &benchmark_streamk_reduce);
 }
