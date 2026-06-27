@@ -29,6 +29,10 @@ def _require_sm90_benchmark() -> None:
         ops._load_moe()
     except Exception as exc:  # pragma: no cover
         pytest.skip(f"marlin moe extension is not available: {exc}")
+    if not hasattr(torch.ops, "_moe_C") or not hasattr(
+        torch.ops._moe_C, "benchmark_streamk_reduce"
+    ):
+        pytest.skip("benchmark_streamk_reduce is not registered in _moe_C")
 
 
 def _parse_result(raw: torch.Tensor) -> dict[str, float]:

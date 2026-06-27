@@ -133,6 +133,7 @@ def test_marlin_moe_symbols_available():
         "moe_align_block_size",
         "batched_moe_align_block_size",
         "moe_wna16_marlin_gemm",
+        "benchmark_streamk_reduce",
     ]
     for name in expected:
         assert hasattr(ops, name)
