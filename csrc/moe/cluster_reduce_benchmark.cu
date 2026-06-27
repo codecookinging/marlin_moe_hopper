@@ -107,12 +107,11 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
   }
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-
 template <int NumFloats, int NumThreads>
 __global__ void cluster_streamk_reduce_bench_kernel(
     float* __restrict__ output, const float* __restrict__ partials, int num_pairs,
     int iters) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   extern __shared__ int4 sh_raw[];
   int4* sh_red = sh_raw;
 
@@ -137,9 +136,8 @@ __global__ void cluster_streamk_reduce_bench_kernel(
     }
     __syncthreads();
   }
+#endif
 }
-
-#endif  // __CUDA_ARCH__ >= 900
 
 template <int NumFloats, int NumThreads>
 void launch_atomic_bench(float* output, const float* partials, int* locks,
@@ -153,6 +151,10 @@ void launch_atomic_bench(float* output, const float* partials, int* locks,
 template <int NumFloats, int NumThreads>
 void launch_cluster_bench(float* output, const float* partials, int num_pairs,
                           int iters, cudaStream_t stream) {
+  using ClusterKernelFn =
+      decltype(cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>);
+  ClusterKernelFn kernel = cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>;
+
   const int cluster_size = 2;
   const int blocks = num_pairs * cluster_size;
   const int smem = NumFloats * sizeof(float);
@@ -171,14 +173,10 @@ void launch_cluster_bench(float* output, const float* partials, int num_pairs,
   config.attrs = &attr;
   config.numAttrs = 1;
 
-  cudaFuncSetAttribute(cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>,
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  cudaFuncSetAttribute(cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>,
-                       cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
 
-  cudaLaunchKernelEx(
-      &config, cluster_streamk_reduce_bench_kernel<NumFloats, NumThreads>,
-      output, partials, num_pairs, iters);
+  cudaLaunchKernelEx(&config, kernel, output, partials, num_pairs, iters);
 }
 
 template <typename LaunchFn>
