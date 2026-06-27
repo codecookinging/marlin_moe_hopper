@@ -74,8 +74,22 @@ def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
 
 def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
     _load_moe()
-    if (args and isinstance(args[0], torch.Tensor)) or kwargs.get("device_guard") is not None:
-        return torch.ops._moe_C.benchmark_streamk_reduce(*args, **kwargs)
-    # PyTorch dispatches to CUDA only when a Tensor argument is present.
-    device_guard = torch.empty((), device="cuda")
-    return torch.ops._moe_C.benchmark_streamk_reduce(device_guard, *args, **kwargs)
+    op = torch.ops._moe_C.benchmark_streamk_reduce
+    schema = str(getattr(op, "_schema", ""))
+    has_device_guard = "device_guard" in schema
+
+    if has_device_guard:
+        if (args and isinstance(args[0], torch.Tensor)) or kwargs.get("device_guard") is not None:
+            return op(*args, **kwargs)
+        device_guard = torch.empty((), device="cuda")
+        return op(device_guard, *args, **kwargs)
+
+    if args or kwargs:
+        raise RuntimeError(
+            "Loaded _moe_C is stale: benchmark_streamk_reduce schema is missing "
+            f"device_guard (schema={schema!r}). Rebuild the extension:\n"
+            "  PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace"
+        )
+    raise RuntimeError(
+        "benchmark_streamk_reduce requires arguments; rebuild _moe_C if this persists."
+    )

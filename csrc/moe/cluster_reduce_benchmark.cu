@@ -12,6 +12,7 @@
 #include <cooperative_groups.h>
 #include <vector>
 
+#include "core/registration.h"
 #include "moe/marlin_moe_wna16/marlin_hopper.cuh"
 
 namespace {
@@ -336,7 +337,7 @@ at::Tensor benchmark_streamk_reduce(const at::Tensor& device_guard,
                 "benchmark_streamk_reduce requires SM90+ for cluster path");
   }
 
-  const at::cuda::OptionalCUDAGuard device_guard(device);
+  const at::cuda::OptionalCUDAGuard cuda_guard(device);
   return dispatch_floats(static_cast<int>(num_floats),
                          static_cast<int>(num_threads),
                          static_cast<int>(num_pairs),
