@@ -174,21 +174,41 @@ def _print_row(row: dict[str, float]) -> None:
     )
 
 
+def _print_benchmark_env() -> tuple[int, int, int]:
+    """Return (num_pairs, warmup_iters, bench_iters) for the print-table sweep."""
+    return (
+        int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "1024")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "5")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "50")),
+    )
+
+
 def print_cluster_reduce_benchmark_table() -> None:
+    num_pairs, warmup_iters, bench_iters = _print_benchmark_env()
     print("\ncluster_streamk_reduce vs atomic global reduce (isolated microbench)")
     print(f"_moe_C: {_moe_extension_path()}")
     print(f"schema: {_benchmark_schema_text()}")
+    print(
+        f"sweep: pairs={num_pairs} warmup={warmup_iters} bench={bench_iters} "
+        "(override via MARLIN_REDUCE_BENCH_* env vars)"
+    )
     print("-" * 88)
+    first = True
     for num_floats in (16, 32, 64):
         for num_threads in (128, 256):
+            print(
+                f"  running num_floats={num_floats} threads={num_threads} ...",
+                flush=True,
+            )
             row = run_benchmark(
                 num_floats=num_floats,
                 num_threads=num_threads,
-                num_pairs=4096,
-                warmup_iters=20,
-                bench_iters=200,
-                run_verify=True,
+                num_pairs=num_pairs,
+                warmup_iters=warmup_iters,
+                bench_iters=bench_iters,
+                run_verify=first,
             )
+            first = False
             _print_row(row)
     print("-" * 88)
 

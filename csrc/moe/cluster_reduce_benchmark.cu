@@ -10,6 +10,7 @@
 #include <torch/all.h>
 
 #include <cooperative_groups.h>
+#include <cooperative_groups/cluster.h>
 #include <vector>
 
 #include "core/registration.h"
@@ -84,7 +85,8 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
       }
       __syncthreads();
       if (threadIdx.x == 0) {
-        *lock = -1;
+        const int val = -1;
+        asm volatile("st.global.release.gpu.b32 [%0], %1;\n" ::"l"(lock), "r"(val));
       }
     }
 
@@ -118,9 +120,14 @@ __global__ void cluster_streamk_reduce_bench_kernel(
 
   cooperative_groups::cluster_group cluster =
       cooperative_groups::this_cluster();
-  const int pair_id = blockIdx.x / cluster.num_blocks();
-  const int slice_idx = cluster.block_rank() == 0 ? 0 : 1;
+  // Match atomic kernel indexing: clusterDim.x == 2 groups (0,1), (2,3), ...
+  const int pair_id = blockIdx.x / 2;
+  const int slice_idx = blockIdx.x % 2;
   if (pair_id >= num_pairs) {
+    return;
+  }
+  // Avoid cluster.sync() deadlock when the launch did not form 2-CTA clusters.
+  if (cluster.num_blocks() != 2) {
     return;
   }
 
@@ -231,9 +238,13 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
     launch_atomic_bench<NumFloats, NumThreads>(
         out_atomic_ptr, partials_ptr, locks_ptr, num_pairs, iters, stream);
   };
+  // One reduce per launch avoids very long cluster.sync() loops inside a single
+  // kernel (which can look like a hang under large num_pairs * bench_iters).
   auto launch_cluster = [&](int iters) {
-    launch_cluster_bench<NumFloats, NumThreads>(
-        out_cluster_ptr, partials_ptr, num_pairs, iters, stream);
+    for (int i = 0; i < iters; ++i) {
+      launch_cluster_bench<NumFloats, NumThreads>(
+          out_cluster_ptr, partials_ptr, num_pairs, /*iters=*/1, stream);
+    }
   };
 
   double max_abs_diff = 0.0;
