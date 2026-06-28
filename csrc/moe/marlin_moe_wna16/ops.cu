@@ -1,7 +1,6 @@
 #include <cstdlib>
 #include <cstdio>
 #include <algorithm>
-#include <vector>
 #include <cuda_runtime.h>
 /*
  * Modified by Neural Magic
@@ -174,31 +173,12 @@ StreamKHostParams compute_streamk_host_params(int parallel_padded, int prob_k,
   return {k_tiles, part2_mn_tiles, iters};
 }
 
-struct ClusterLaunchPlan {
-  int physical_blocks = 0;
-  int cluster_size = 1;
-  int max_batch_size = 1;
-  int max_group_size = 1;
-  bool has_partial_batch = false;
-  std::vector<int> phys_to_logical;
-};
-
-ClusterLaunchPlan build_cluster_launch_plan(int logical_blocks, int cluster_size,
-                                            int k_tiles, int iters,
-                                            int part2_mn_tiles) {
-  ClusterLaunchPlan plan;
-  plan.cluster_size = cluster_size;
-  plan.phys_to_logical.reserve(
-      ((logical_blocks + cluster_size - 1) / cluster_size) * cluster_size * 2);
-
-  if (part2_mn_tiles >= logical_blocks) {
-    for (int b = 0; b < logical_blocks; ++b) {
-      plan.phys_to_logical.push_back(b);
-    }
-    plan.physical_blocks = logical_blocks;
-    return plan;
+bool can_use_identity_pair_cluster(int logical_blocks, int cluster_size,
+                                   int k_tiles, int iters,
+                                   int part2_mn_tiles) {
+  if (cluster_size != 2 || part2_mn_tiles >= logical_blocks) {
+    return false;
   }
-
   int b = 0;
   while (b < logical_blocks) {
     int group_key = (iters * b) / k_tiles;
@@ -206,27 +186,12 @@ ClusterLaunchPlan build_cluster_launch_plan(int logical_blocks, int cluster_size
     while (end < logical_blocks && (iters * end) / k_tiles == group_key) {
       ++end;
     }
-    plan.max_group_size = std::max(plan.max_group_size, end - b);
-    int pos = b;
-    while (pos < end) {
-      const int batch_size = std::min(cluster_size, end - pos);
-      plan.max_batch_size = std::max(plan.max_batch_size, batch_size);
-      if (batch_size != cluster_size) {
-        plan.has_partial_batch = true;
-      }
-      const int batch_high = end - 1 - (pos - b);
-      for (int rank = 0; rank < batch_size; ++rank) {
-        plan.phys_to_logical.push_back(batch_high - rank);
-      }
-      for (int pad = batch_size; pad < cluster_size; ++pad) {
-        plan.phys_to_logical.push_back(-1);
-      }
-      pos += batch_size;
+    if (b % cluster_size != 0 || end - b != cluster_size) {
+      return false;
     }
     b = end;
   }
-  plan.physical_blocks = static_cast<int>(plan.phys_to_logical.size());
-  return plan;
+  return true;
 }
 
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
@@ -482,9 +447,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       (const int32_t*)num_tokens_past_padded;
   const float* topk_weights_ptr = (const float*)topk_weights;
   int* locks = (int*)workspace;
-  int* cluster_cta_map_dev = nullptr;
   const int* cluster_cta_map_ptr = nullptr;
-  int cluster_map_bytes = 0;
 
   if (has_act_order) {
     // Permute A columns
@@ -658,26 +621,19 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     StreamKHostParams sk = compute_streamk_host_params(
         parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
         logical_blocks);
-    ClusterLaunchPlan plan = build_cluster_launch_plan(
+    bool use_identity_cluster = can_use_identity_pair_cluster(
         logical_blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
 
-    if (sk.part2_mn_tiles >= logical_blocks || plan.max_batch_size <= 1 ||
-        plan.has_partial_batch || plan.max_group_size != cluster_size) {
+    if (!use_identity_cluster) {
       use_cluster_reduce = false;
       use_atomic_add = true;
       use_fp32_reduce = false;
       cluster_size = 1;
-      cluster_cta_map_dev = nullptr;
       cluster_cta_map_ptr = nullptr;
       locks = (int*)workspace;
     } else {
-      blocks = plan.physical_blocks;
-      cluster_map_bytes = blocks * static_cast<int>(sizeof(int));
-      cluster_cta_map_dev = locks;
-      cluster_cta_map_ptr = cluster_cta_map_dev;
-      locks = locks + blocks;
-      cudaMemcpyAsync(cluster_cta_map_dev, plan.phys_to_logical.data(),
-                      cluster_map_bytes, cudaMemcpyHostToDevice, stream);
+      blocks = logical_blocks;
+      cluster_cta_map_ptr = nullptr;
       cudaFuncSetAttribute(kernel,
                            cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
     }

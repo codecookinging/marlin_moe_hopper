@@ -316,9 +316,10 @@ __global__ void Marlin(
 
   int cta_block = blockIdx.x;
   if (use_cluster_reduce) {
-    if (cluster_cta_map == nullptr) return;
-    cta_block = cluster_cta_map[blockIdx.x];
-    if (cta_block < 0) return;
+    if (cluster_cta_map != nullptr) {
+      cta_block = cluster_cta_map[blockIdx.x];
+      if (cta_block < 0) return;
+    }
   }
   const int schedule_blocks = use_cluster_reduce ? logical_blocks : gridDim.x;
 
