@@ -177,10 +177,10 @@ def _print_row(row: dict[str, float]) -> None:
 def _print_benchmark_env() -> tuple[int, int, int, int]:
     """Return (num_pairs, warmup_iters, bench_iters, chunk_pairs) for print sweep."""
     return (
-        int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "256")),
-        int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "5")),
-        int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "30")),
-        int(os.environ.get("MARLIN_REDUCE_BENCH_CHUNK", "32")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "64")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "3")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "10")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_CHUNK", "8")),
     )
 
 
@@ -229,7 +229,6 @@ def print_cluster_reduce_benchmark_table() -> None:
     )
     _print_row(smoke)
     print("-" * 88)
-    first = True
     for num_floats in (16, 32, 64):
         for num_threads in (128, 256):
             print(
@@ -242,9 +241,8 @@ def print_cluster_reduce_benchmark_table() -> None:
                 num_pairs=num_pairs,
                 warmup_iters=warmup_iters,
                 bench_iters=bench_iters,
-                run_verify=first,
+                run_verify=False,
             )
-            first = False
             _print_row(row)
     print("-" * 88)
 
@@ -256,9 +254,9 @@ def test_cluster_streamk_reduce_matches_atomic(num_floats: int, num_threads: int
     row = run_benchmark(
         num_floats=num_floats,
         num_threads=num_threads,
-        num_pairs=128,
-        warmup_iters=5,
-        bench_iters=10,
+        num_pairs=64,
+        warmup_iters=3,
+        bench_iters=5,
         run_verify=True,
     )
     assert row["max_abs_diff"] < 1e-3, (

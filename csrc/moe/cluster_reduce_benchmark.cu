@@ -227,7 +227,7 @@ double time_kernel(LaunchFn launch, int warmup_iters, int bench_iters,
   return static_cast<double>(ms) * 1e6 / static_cast<double>(bench_iters);
 }
 
-constexpr int kDefaultChunkPairs = 32;
+constexpr int kDefaultChunkPairs = 8;
 
 int chunk_pairs_for_launch(int num_pairs) {
   int chunk = kDefaultChunkPairs;
@@ -275,14 +275,16 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
         partials_ptr + pair_off * 2 * NumFloats, pairs_in_chunk, iters, stream);
   };
 
+  // One reduce per launch keeps concurrent follower spinners bounded (per chunk)
+  // and matches the cluster launch model for apples-to-apples timing.
   auto launch_atomic = [&](int iters) {
-    for (int off = 0; off < num_pairs; off += chunk_pairs) {
-      const int n = std::min(chunk_pairs, num_pairs - off);
-      launch_atomic_chunk(off, n, iters);
+    for (int rep = 0; rep < iters; ++rep) {
+      for (int off = 0; off < num_pairs; off += chunk_pairs) {
+        const int n = std::min(chunk_pairs, num_pairs - off);
+        launch_atomic_chunk(off, n, /*iters=*/1);
+      }
     }
   };
-  // One reduce per launch avoids very long cluster.sync() loops inside a single
-  // kernel (which can look like a hang under large num_pairs * bench_iters).
   auto launch_cluster = [&](int iters) {
     if (!run_cluster) {
       return;
