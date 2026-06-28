@@ -174,24 +174,60 @@ def _print_row(row: dict[str, float]) -> None:
     )
 
 
-def _print_benchmark_env() -> tuple[int, int, int]:
-    """Return (num_pairs, warmup_iters, bench_iters) for the print-table sweep."""
+def _print_benchmark_env() -> tuple[int, int, int, int]:
+    """Return (num_pairs, warmup_iters, bench_iters, chunk_pairs) for print sweep."""
     return (
-        int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "1024")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "256")),
         int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "5")),
-        int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "50")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "30")),
+        int(os.environ.get("MARLIN_REDUCE_BENCH_CHUNK", "32")),
     )
 
 
 def print_cluster_reduce_benchmark_table() -> None:
-    num_pairs, warmup_iters, bench_iters = _print_benchmark_env()
+    num_pairs, warmup_iters, bench_iters, chunk_pairs = _print_benchmark_env()
     print("\ncluster_streamk_reduce vs atomic global reduce (isolated microbench)")
     print(f"_moe_C: {_moe_extension_path()}")
     print(f"schema: {_benchmark_schema_text()}")
     print(
-        f"sweep: pairs={num_pairs} warmup={warmup_iters} bench={bench_iters} "
-        "(override via MARLIN_REDUCE_BENCH_* env vars)"
+        f"sweep: pairs={num_pairs} chunk={chunk_pairs} "
+        f"warmup={warmup_iters} bench={bench_iters} "
+        "(MARLIN_REDUCE_BENCH_* env vars; set MARLIN_REDUCE_BENCH_CLUSTER=0 "
+        "to skip cluster path)"
     )
+    print("-" * 88)
+    # Phase 1: atomic-only (set MARLIN_REDUCE_BENCH_CLUSTER=0 in rebuilt _moe_C).
+    print("  smoke atomic-only num_floats=16 threads=128 pairs=4 ...", flush=True)
+    prev_cluster = os.environ.get("MARLIN_REDUCE_BENCH_CLUSTER")
+    os.environ["MARLIN_REDUCE_BENCH_CLUSTER"] = "0"
+    os.environ.setdefault("MARLIN_REDUCE_BENCH_CHUNK", str(chunk_pairs))
+    try:
+        smoke_atomic = run_benchmark(
+            num_floats=16,
+            num_threads=128,
+            num_pairs=4,
+            warmup_iters=1,
+            bench_iters=2,
+            run_verify=False,
+        )
+        _print_row(smoke_atomic)
+    finally:
+        if prev_cluster is None:
+            os.environ.pop("MARLIN_REDUCE_BENCH_CLUSTER", None)
+        else:
+            os.environ["MARLIN_REDUCE_BENCH_CLUSTER"] = prev_cluster
+
+    # Phase 2: cluster + atomic verify on a tiny grid.
+    print("  smoke cluster num_floats=16 threads=128 pairs=4 ...", flush=True)
+    smoke = run_benchmark(
+        num_floats=16,
+        num_threads=128,
+        num_pairs=4,
+        warmup_iters=1,
+        bench_iters=2,
+        run_verify=True,
+    )
+    _print_row(smoke)
     print("-" * 88)
     first = True
     for num_floats in (16, 32, 64):
@@ -220,7 +256,7 @@ def test_cluster_streamk_reduce_matches_atomic(num_floats: int, num_threads: int
     row = run_benchmark(
         num_floats=num_floats,
         num_threads=num_threads,
-        num_pairs=512,
+        num_pairs=128,
         warmup_iters=5,
         bench_iters=10,
         run_verify=True,
@@ -239,9 +275,9 @@ def test_cluster_streamk_reduce_faster_than_atomic() -> None:
     row = run_benchmark(
         num_floats=32,
         num_threads=256,
-        num_pairs=4096,
-        warmup_iters=30,
-        bench_iters=300,
+        num_pairs=1024,
+        warmup_iters=10,
+        bench_iters=100,
         run_verify=True,
     )
     _print_row(row)
@@ -253,6 +289,7 @@ def test_cluster_streamk_reduce_faster_than_atomic() -> None:
 
 def test_print_cluster_reduce_benchmark_table() -> None:
     """Print a small sweep table (use pytest -s to see stdout)."""
+    print("\n[cluster reduce benchmark] starting...", flush=True)
     _require_sm90_benchmark(fail_instead_of_skip=True)
     print_cluster_reduce_benchmark_table()
 

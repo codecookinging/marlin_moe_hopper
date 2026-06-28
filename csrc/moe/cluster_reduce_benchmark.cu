@@ -10,6 +10,11 @@
 #include <torch/all.h>
 
 #include <cooperative_groups.h>
+#include <cooperative_groups/cluster.h>
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "core/registration.h"
@@ -20,10 +25,17 @@ namespace {
 __device__ __forceinline__ void bench_wait_negative_and_add(int* lock) {
   if (threadIdx.x == 0) {
     int state = 0;
+    int delay = 32;
     do {
       asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
                    : "=r"(state)
                    : "l"(lock));
+      if (state >= 0) {
+        // Back off so follower CTAs do not monopolize SMs and starve the
+        // leader CTA that must publish lock = -1 (otherwise the grid hangs).
+        __nanosleep(delay);
+        delay = delay < 8192 ? delay * 2 : 8192;
+      }
     } while (state >= 0);
     atomicAdd(lock, 1);
   }
@@ -216,6 +228,23 @@ double time_kernel(LaunchFn launch, int warmup_iters, int bench_iters,
   return static_cast<double>(ms) * 1e6 / static_cast<double>(bench_iters);
 }
 
+constexpr int kDefaultChunkPairs = 32;
+
+int chunk_pairs_for_launch(int num_pairs) {
+  int chunk = kDefaultChunkPairs;
+  if (const char* env = std::getenv("MARLIN_REDUCE_BENCH_CHUNK")) {
+    chunk = std::max(1, std::atoi(env));
+  }
+  return std::min(chunk, num_pairs);
+}
+
+bool cluster_bench_enabled() {
+  if (const char* env = std::getenv("MARLIN_REDUCE_BENCH_CLUSTER")) {
+    return std::strcmp(env, "0") != 0;
+  }
+  return true;
+}
+
 template <int NumFloats, int NumThreads>
 at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
                             bool run_verify, at::Device device) {
@@ -232,17 +261,38 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
   int* locks_ptr = locks.data_ptr<int>();
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  const int chunk_pairs = chunk_pairs_for_launch(num_pairs);
+  const bool run_cluster = cluster_bench_enabled();
+
+  auto launch_atomic_chunk = [&](int pair_off, int pairs_in_chunk, int iters) {
+    launch_atomic_bench<NumFloats, NumThreads>(
+        out_atomic_ptr + pair_off * NumFloats,
+        partials_ptr + pair_off * 2 * NumFloats, locks_ptr + pair_off,
+        pairs_in_chunk, iters, stream);
+  };
+  auto launch_cluster_chunk = [&](int pair_off, int pairs_in_chunk, int iters) {
+    launch_cluster_bench<NumFloats, NumThreads>(
+        out_cluster_ptr + pair_off * NumFloats,
+        partials_ptr + pair_off * 2 * NumFloats, pairs_in_chunk, iters, stream);
+  };
 
   auto launch_atomic = [&](int iters) {
-    launch_atomic_bench<NumFloats, NumThreads>(
-        out_atomic_ptr, partials_ptr, locks_ptr, num_pairs, iters, stream);
+    for (int off = 0; off < num_pairs; off += chunk_pairs) {
+      const int n = std::min(chunk_pairs, num_pairs - off);
+      launch_atomic_chunk(off, n, iters);
+    }
   };
   // One reduce per launch avoids very long cluster.sync() loops inside a single
   // kernel (which can look like a hang under large num_pairs * bench_iters).
   auto launch_cluster = [&](int iters) {
-    for (int i = 0; i < iters; ++i) {
-      launch_cluster_bench<NumFloats, NumThreads>(
-          out_cluster_ptr, partials_ptr, num_pairs, /*iters=*/1, stream);
+    if (!run_cluster) {
+      return;
+    }
+    for (int rep = 0; rep < iters; ++rep) {
+      for (int off = 0; off < num_pairs; off += chunk_pairs) {
+        const int n = std::min(chunk_pairs, num_pairs - off);
+        launch_cluster_chunk(off, n, /*iters=*/1);
+      }
     }
   };
 
@@ -252,11 +302,13 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
     output_cluster.zero_();
     locks.zero_();
     launch_atomic(1);
-    cudaStreamSynchronize(stream);
-    launch_cluster(1);
-    cudaStreamSynchronize(stream);
-    max_abs_diff =
-        (output_cluster - output_atomic).abs().max().item<double>();
+    C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (run_cluster) {
+      launch_cluster(1);
+      C10_CUDA_CHECK(cudaStreamSynchronize(stream));
+      max_abs_diff =
+          (output_cluster - output_atomic).abs().max().item<double>();
+    }
 
     output_atomic.zero_();
     output_cluster.zero_();
@@ -266,8 +318,11 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
   const double atomic_ns = time_kernel(launch_atomic, warmup_iters, bench_iters,
                                        stream);
 
-  const double cluster_ns =
-      time_kernel(launch_cluster, warmup_iters, bench_iters, stream);
+  double cluster_ns = 0.0;
+  if (run_cluster) {
+    cluster_ns =
+        time_kernel(launch_cluster, warmup_iters, bench_iters, stream);
+  }
 
   C10_CUDA_CHECK(cudaGetLastError());
 
