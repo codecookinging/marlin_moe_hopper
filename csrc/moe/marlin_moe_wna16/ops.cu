@@ -598,6 +598,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                        max_shared_mem);
 
   int cluster_size = 1;
+  const char* force_cluster_env = std::getenv("MARLIN_MOE_FORCE_CLUSTER_REDUCE");
+  const bool force_cluster_reduce =
+      force_cluster_env != nullptr && force_cluster_env[0] == '1';
+  if (use_cluster_reduce && !force_cluster_reduce) {
+    use_cluster_reduce = false;
+    use_atomic_add = true;
+    use_fp32_reduce = false;
+  }
   if (use_cluster_reduce) {
     cluster_size = 2;
 #if defined(CUDA_VERSION) && CUDA_VERSION >= 12000

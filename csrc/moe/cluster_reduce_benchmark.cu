@@ -327,7 +327,7 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
 
   // [num_floats, num_threads, atomic_ns_per_pair, cluster_ns_per_pair,
   //  max_abs_diff, num_pairs, atomic_ns_per_launch]
-  auto result = torch::empty({7}, options);
+  auto result = torch::empty({7}, torch::TensorOptions().dtype(torch::kFloat32));
   float* r = result.data_ptr<float>();
   r[0] = static_cast<float>(NumFloats);
   r[1] = static_cast<float>(NumThreads);
