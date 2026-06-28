@@ -10,7 +10,6 @@
 #include <torch/all.h>
 
 #include <cooperative_groups.h>
-#include <cooperative_groups/cluster.h>
 
 #include <algorithm>
 #include <cstdlib>
