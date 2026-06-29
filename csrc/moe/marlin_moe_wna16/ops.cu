@@ -597,7 +597,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       num_groups, prob_m, prob_n, prob_k, locks, has_bias, use_atomic_add,
       use_fp32_reduce, cluster_partials_ptr, cluster_cta_pair_id_ptr,
       cluster_tail_meta_ptr, c_type.id(), thread_m_blocks, thread_n_blocks,
-      m_block_size_8, is_a_8bit, moe_block_size, top_k);
+      m_block_size_8, is_a_8bit, moe_block_size);
   // clang-format on
 
   if (cluster_partials_ptr != nullptr) {

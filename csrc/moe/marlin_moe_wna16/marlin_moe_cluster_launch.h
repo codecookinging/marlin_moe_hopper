@@ -430,7 +430,7 @@ inline void dispatch_marlin_moe_launch_and_tail(
     bool use_fp32_reduce, float* cluster_partials,
     const int* cluster_cta_pair_id, int* cluster_tail_meta,
     vllm::ScalarTypeId c_type_id, int thread_m_blocks, int thread_n_blocks,
-    bool m_block_size_8, bool is_a_8bit, int moe_block_size, int top_k) {
+    bool m_block_size_8, bool is_a_8bit, int moe_block_size) {
   const bool use_tail = tail_plan.use_tail_cluster && cluster_partials != nullptr;
   dispatch_marlin_moe_launch(
       kernel, plan, num_threads, max_shared_mem, stream, A, B, C, C_tmp,
