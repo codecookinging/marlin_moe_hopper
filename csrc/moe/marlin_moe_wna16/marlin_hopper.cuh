@@ -103,6 +103,7 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
       }
     }
   }
+  __syncthreads();
   cluster.sync();
 
   if (slice_idx == 0) {
@@ -125,6 +126,7 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
       }
     }
   }
+  __syncthreads();
   cluster.sync();
 
   status.ok = true;

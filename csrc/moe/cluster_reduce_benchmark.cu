@@ -28,6 +28,28 @@
 
 namespace {
 
+__device__ __forceinline__ void bench_wait_lock_eq(int* lock, int expected) {
+  if (threadIdx.x == 0) {
+    int state = 0;
+    int delay = 32;
+    do {
+      asm volatile("ld.global.acquire.gpu.b32 %0, [%1];\n"
+                   : "=r"(state)
+                   : "l"(lock));
+      if (state != expected) {
+        __nanosleep(delay);
+        delay = delay < 8192 ? delay * 2 : 8192;
+      }
+    } while (state != expected);
+  }
+  __syncthreads();
+}
+
+__device__ __forceinline__ void bench_release_store(int* lock, int value) {
+  if (threadIdx.x == 0) {
+    asm volatile("st.global.release.gpu.b32 [%0], %1;\n" ::"l"(lock), "r"(value));
+  }
+}
 __device__ __forceinline__ void bench_wait_negative_and_add(int* lock) {
   if (threadIdx.x == 0) {
     int state = 0;
@@ -116,12 +138,12 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
     load_partial_strided<NumFloats>(partial_base, sh_frag);
 
     if (slice_idx == 0) {
+      if (iter > 0) {
+        bench_wait_lock_eq(lock, 0);
+      }
       zero_output_strided<NumFloats>(out_base);
       __syncthreads();
-      if (threadIdx.x == 0) {
-        const int val = 1 - SlicesPerTile;
-        asm volatile("st.global.release.gpu.b32 [%0], %1;\n" ::"l"(lock), "r"(val));
-      }
+      bench_release_store(lock, 1 - SlicesPerTile);
     }
 
     __syncthreads();
@@ -131,6 +153,18 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
     }
 
     atomic_accumulate_strided<NumFloats>(sh_frag, out_base);
+    __syncthreads();
+
+    // Cross-CTA epoch barrier: slice 1 finishes first, then slice 0 resets lock.
+    if (slice_idx != 0) {
+      bench_release_store(lock, 1);
+    }
+    if (slice_idx == 0) {
+      if (iter + 1 < iters) {
+        bench_wait_lock_eq(lock, 1);
+        bench_release_store(lock, 0);
+      }
+    }
     __syncthreads();
   }
 }

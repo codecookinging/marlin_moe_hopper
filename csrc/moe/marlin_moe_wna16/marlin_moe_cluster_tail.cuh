@@ -118,11 +118,11 @@ __global__ void marlin_moe_cluster_tail_kernel(
   }
 
   const int pair_id = blockIdx.x / 2;
-  if (pair_id >= num_pairs) {
+  const int slice_idx = cluster.block_rank();
+  const bool active = pair_id < num_pairs;
+  if (!active) {
     return;
   }
-
-  const int slice_idx = cluster.block_rank();
 
   float frag_c[NumFloats];
   const float* src =
