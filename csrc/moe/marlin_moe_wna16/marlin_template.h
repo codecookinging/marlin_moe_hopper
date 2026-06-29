@@ -614,8 +614,8 @@ __global__ void Marlin(
       locks_off++;
     }
 
-    if (first_init && use_atomic_add && !use_cluster_reduce &&
-        slice_count > 1 && slice_idx == 0) {
+    if (first_init && slice_count > 1 && slice_idx == 0 &&
+        (use_atomic_add || use_cluster_reduce)) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(block_num_valid_tokens, threads / threads_per_m);
@@ -2230,8 +2230,9 @@ __global__ void Marlin(
       }
 
       bool cluster_reduced = false;
+      bool atomic_fallback = use_atomic_add;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      if (use_cluster_reduce && in_part2 && slice_count > 1) {
+      if (use_cluster_reduce && in_part2 && slice_count == 2) {
         constexpr int cluster_num_floats =
             thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
         marlin_hopper::ClusterReduceStatus cluster_status =
@@ -2252,14 +2253,17 @@ __global__ void Marlin(
             write_result(true);
           }
         } else {
-          cluster_reduced = false;
+          atomic_fallback = true;
         }
+      } else if (use_cluster_reduce && in_part2 && slice_count > 1) {
+        atomic_fallback = true;
       }
 #endif
 
       if (!cluster_reduced) {
-        if (slice_count > 1 && !use_atomic_add) {
-          // only globally reduce if there is more than one block in a slice
+        if (slice_count > 1 && !atomic_fallback) {
+          // lock+global reduce: only when atomic/cluster paths are disabled
+          // (e.g. MARLIN_MOE_FORCE_LOCK_REDUCE debugging).
           barrier_acquire(&locks[locks_off], slice_idx);
           if (use_fp32_reduce) {
             global_reduce_fp32(slice_idx == 0, last);
@@ -2278,9 +2282,9 @@ __global__ void Marlin(
           __syncthreads();
         }
 
-        if (use_atomic_add && slice_count > 1 && slice_idx != 0)
+        if (atomic_fallback && slice_count > 1 && slice_idx != 0)
           wait_negative_and_add(&locks[locks_off]);
-        if (last || use_atomic_add)
+        if (last || atomic_fallback)
           // only the last block in a slice actually writes the result
           write_result(last);
       }

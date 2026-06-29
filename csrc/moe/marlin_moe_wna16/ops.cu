@@ -28,6 +28,7 @@
 #endif
 
 #include "kernel.h"
+#include "marlin_moe_cluster_launch.h"
 #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -148,51 +149,6 @@ typedef struct {
   int blocks_per_sm;
   thread_config_t tb_cfg;
 } exec_config_t;
-
-struct StreamKHostParams {
-  int k_tiles;
-  int part2_mn_tiles;
-  int iters;
-};
-
-StreamKHostParams compute_streamk_host_params(int parallel_padded, int prob_k,
-                                              int prob_n, int thread_k_blocks,
-                                              int thread_n_blocks,
-                                              int logical_blocks) {
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
-  int global_mn_tiles = parallel_padded * n_tiles;
-  int part2_mn_tiles = global_mn_tiles;
-  if (global_mn_tiles > logical_blocks) {
-    part2_mn_tiles = global_mn_tiles % logical_blocks;
-    if (part2_mn_tiles * 3 <= logical_blocks) {
-      part2_mn_tiles += logical_blocks;
-    }
-  }
-  int iters = div_ceil(k_tiles * part2_mn_tiles, logical_blocks);
-  return {k_tiles, part2_mn_tiles, iters};
-}
-
-bool can_use_identity_pair_cluster(int logical_blocks, int cluster_size,
-                                   int k_tiles, int iters,
-                                   int part2_mn_tiles) {
-  if (cluster_size != 2 || part2_mn_tiles >= logical_blocks) {
-    return false;
-  }
-  int b = 0;
-  while (b < logical_blocks) {
-    int group_key = (iters * b) / k_tiles;
-    int end = b + 1;
-    while (end < logical_blocks && (iters * end) / k_tiles == group_key) {
-      ++end;
-    }
-    if (b % cluster_size != 0 || end - b != cluster_size) {
-      return false;
-    }
-    b = end;
-  }
-  return true;
-}
 
 int get_scales_cache_size(thread_config_t const& th_config, int prob_m,
                           int prob_n, int prob_k, int num_bits, int group_size,
@@ -399,7 +355,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
                bool use_fp32_reduce, bool is_zp_float,
-               int num_tokens_past_padded_count, bool use_cluster_reduce) {
+               int num_tokens_past_padded_count) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -447,7 +403,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       (const int32_t*)num_tokens_past_padded;
   const float* topk_weights_ptr = (const float*)topk_weights;
   int* locks = (int*)workspace;
-  const int* cluster_cta_map_ptr = nullptr;
 
   if (has_act_order) {
     // Permute A columns
@@ -597,86 +552,24 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        max_shared_mem);
 
-  int cluster_size = 1;
-  const char* force_cluster_env = std::getenv("MARLIN_MOE_FORCE_CLUSTER_REDUCE");
-  const bool force_cluster_reduce =
-      force_cluster_env != nullptr && force_cluster_env[0] == '1';
-  if (use_cluster_reduce && !force_cluster_reduce) {
-    use_cluster_reduce = false;
-    use_atomic_add = true;
-    use_fp32_reduce = false;
-  }
-  if (use_cluster_reduce) {
-    cluster_size = 2;
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
-    cudaLaunchConfig_t occ_cfg{};
-    occ_cfg.blockDim = num_threads;
-    occ_cfg.dynamicSmemBytes = max_shared_mem;
-    int max_cluster = 0;
-    if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) ==
-            cudaSuccess &&
-        max_cluster > 0) {
-      cluster_size = std::min(max_cluster, cluster_size);
-    }
-#endif
-
-    if (cluster_size <= 1) {
-      use_cluster_reduce = false;
-    }
-  }
-  if (use_cluster_reduce) {
-    int parallel_padded = num_tokens_past_padded_count / moe_block_size;
-    StreamKHostParams sk = compute_streamk_host_params(
-        parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
-        logical_blocks);
-    bool use_identity_cluster = can_use_identity_pair_cluster(
-        logical_blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
-
-    if (!use_identity_cluster) {
-      use_cluster_reduce = false;
-      use_atomic_add = true;
-      use_fp32_reduce = false;
-      cluster_size = 1;
-      cluster_cta_map_ptr = nullptr;
-      locks = (int*)workspace;
-    } else {
-      blocks = logical_blocks;
-      cluster_cta_map_ptr = nullptr;
-      cudaFuncSetAttribute(kernel,
-                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    }
-  }
+  int parallel_padded = num_tokens_past_padded_count / moe_block_size;
+  marlin_moe_host::ClusterLaunchPlan cluster_plan =
+      marlin_moe_host::compute_cluster_launch_plan(
+          major_capability, parallel_padded, prob_k, prob_n, thread_k_blocks,
+          thread_n_blocks, logical_blocks, blocks, use_atomic_add,
+          use_fp32_reduce, kernel, num_threads, max_shared_mem);
+  use_atomic_add = cluster_plan.use_atomic_add;
+  use_fp32_reduce = cluster_plan.use_fp32_reduce;
+  blocks = cluster_plan.launch_blocks;
 
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
-  if (use_cluster_reduce && cluster_size > 1) {
-    cudaLaunchConfig_t config{};
-    config.gridDim = blocks;
-    config.blockDim = num_threads;
-    config.dynamicSmemBytes = max_shared_mem;
-    config.stream = stream;
-    cudaLaunchAttribute attr{};
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim.x = cluster_size;
-    attr.val.clusterDim.y = 1;
-    attr.val.clusterDim.z = 1;
-    config.attrs = &attr;
-    config.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &config, kernel, A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr,
-        b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr, sorted_token_ids_ptr,
-        expert_ids_ptr, num_tokens_past_padded_ptr, topk_weights_ptr, top_k,
-        mul_topk_weights, num_groups, prob_m, prob_n, prob_k, logical_blocks,
-        cluster_cta_map_ptr, locks, has_bias, use_atomic_add, use_fp32_reduce,
-        use_cluster_reduce);
-  } else {
-    kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
-        sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-        topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-        prob_n, prob_k, logical_blocks, cluster_cta_map_ptr, locks, has_bias,
-        use_atomic_add, use_fp32_reduce, use_cluster_reduce);
-  }
+  marlin_moe_host::dispatch_marlin_moe_launch(
+      kernel, cluster_plan, num_threads, max_shared_mem, stream, A_ptr, B_ptr,
+      C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
+      prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
   // clang-format on
 }
 
@@ -852,15 +745,6 @@ torch::Tensor moe_wna16_marlin_gemm(
     use_fp32_reduce = false;
   }
 
-  bool use_cluster_reduce = false;
-  const char* cluster_reduce_env = std::getenv("MARLIN_MOE_USE_CLUSTER_REDUCE");
-  if (cluster_reduce_env != nullptr && cluster_reduce_env[0] == '1') {
-    use_cluster_reduce = true;
-    if (!force_lock_reduce) {
-      use_atomic_add = false;
-    }
-  }
-
   // Alloc C tmp buffer that is going to be used for the global reduce
   torch::Tensor c_tmp;
   if (use_fp32_reduce && !use_atomic_add) {
@@ -1012,25 +896,11 @@ torch::Tensor moe_wna16_marlin_gemm(
   int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
   int parallel_padded = num_tokens_past_padded_count / (int)moe_block_size;
   int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
-
-  int dev = a.get_device();
-  int major_capability = 0;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
-  if (!use_cluster_reduce || major_capability < 9) {
-    use_cluster_reduce = false;
-    if (!force_lock_reduce) {
-      use_atomic_add = true;
-    }
-  }
-  if (use_cluster_reduce) {
-    int max_logical_blocks = sms * (int)blocks_per_sm;
-    min_workspace_size += max_logical_blocks * 2;
-  }
-
   TORCH_CHECK(workspace.numel() >= min_workspace_size,
               "workspace.numel = ", workspace.numel(),
               " is below min_workspace_size = ", min_workspace_size);
+
+  int dev = a.get_device();
 
   TORCH_CHECK(a_scales.scalar_type() == at::ScalarType::Float,
               "scalar type of a_scales must be float");
@@ -1053,7 +923,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, num_tokens_past_padded_count, use_cluster_reduce);
+      is_zp_float, num_tokens_past_padded_count);
 
   return c;
 }
