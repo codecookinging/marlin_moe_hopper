@@ -92,33 +92,35 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
   constexpr int Tail = NumFloats - Vecs * 4;
   
   float4* frag4 = reinterpret_cast<float4*>(frag_c);
-  float4* pack4 = reinterpret_cast<float4*>(pack);
 
-  // We can use a single synchronization point if we write all data first
+  // Slice 1 PUSHES data directly to Slice 0's shared memory (remote store)
   if (slice_idx == 1) {
+    float* peer_pack = cluster.map_shared_rank(pack, 0);
+    float4* peer4 = reinterpret_cast<float4*>(peer_pack);
+    
+#pragma unroll
     for (int i = 0; i < Vecs; ++i) {
-      pack4[i * blockDim.x + threadIdx.x] = frag4[i];
+      peer4[i * blockDim.x + threadIdx.x] = frag4[i];
     }
     if constexpr (Tail > 0) {
+#pragma unroll
       for (int t = 0; t < Tail; ++t) {
-        pack[(Vecs * 4 + t) * blockDim.x + threadIdx.x] = frag_c[Vecs * 4 + t];
+        peer_pack[(Vecs * 4 + t) * blockDim.x + threadIdx.x] = frag_c[Vecs * 4 + t];
       }
     }
   }
   
-  // Wait for slice 1 to finish writing to its shared memory
+  // Wait for Slice 1 to finish writing to Slice 0's shared memory
   cluster.sync();
 
+  // Slice 0 reads from its LOCAL shared memory and accumulates
   if (slice_idx == 0) {
-    float* peer_pack = cluster.map_shared_rank(pack, 1 - rank);
-    float4* peer4 = reinterpret_cast<float4*>(peer_pack);
+    float4* local4 = reinterpret_cast<float4*>(pack);
     
+#pragma unroll
     for (int i = 0; i < Vecs; ++i) {
       float4 a = frag4[i];
-      // Use direct memory reads over DSMEM. The hardware will handle this efficiently.
-      // Alternatively, we could use cp.async.bulk to pull the data into local shared memory first,
-      // but for this fine-grained reduction, direct reads are often optimal.
-      float4 b = peer4[i * blockDim.x + threadIdx.x];
+      float4 b = local4[i * blockDim.x + threadIdx.x]; // Local SMEM read!
       a.x += b.x;
       a.y += b.y;
       a.z += b.z;
@@ -127,13 +129,14 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
     }
     
     if constexpr (Tail > 0) {
+#pragma unroll
       for (int t = 0; t < Tail; ++t) {
-        frag_c[Vecs * 4 + t] += peer_pack[(Vecs * 4 + t) * blockDim.x + threadIdx.x];
+        frag_c[Vecs * 4 + t] += pack[(Vecs * 4 + t) * blockDim.x + threadIdx.x];
       }
     }
   }
   
-  // Ensure slice 0 has finished reading before slice 1 can exit and potentially overwrite
+  // Ensure Slice 0 has finished reading before Slice 1 can exit and potentially overwrite
   cluster.sync();
 
   status.ok = true;
