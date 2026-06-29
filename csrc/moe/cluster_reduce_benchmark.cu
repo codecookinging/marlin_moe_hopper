@@ -62,7 +62,7 @@ template <int NumFloats>
 __device__ __forceinline__ void store_result_strided(const float* frag,
                                                      float* dst) {
   constexpr int Vecs = NumFloats / 4;
-  const float4* src4 = reinterpret_cast<const float4*>(src);
+  const float4* src4 = reinterpret_cast<const float4*>(frag);
   float4* dst4 = reinterpret_cast<float4*>(dst);
   for (int v = threadIdx.x; v < Vecs; v += blockDim.x) {
     dst4[v] = src4[v];

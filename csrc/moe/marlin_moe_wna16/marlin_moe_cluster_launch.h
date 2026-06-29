@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 
 #include <cuda_runtime.h>
@@ -45,8 +46,8 @@ inline bool needs_part2_streamk_tail(int parallel_padded, int prob_k,
 }
 
 inline bool can_use_identity_pair_cluster(int logical_blocks, int cluster_size,
-                                        int k_tiles, int iters,
-                                        int part2_mn_tiles) {
+                                          int k_tiles, int iters,
+                                          int part2_mn_tiles) {
   if (cluster_size != 2 || part2_mn_tiles >= logical_blocks) {
     return false;
   }
@@ -65,6 +66,61 @@ inline bool can_use_identity_pair_cluster(int logical_blocks, int cluster_size,
   return true;
 }
 
+// Mirror device init_part2_slice() slice_count for the first Part2 matmul slice.
+inline int part2_first_slice_count(int cta_block, int k_tiles, int iters,
+                                     int part2_mn_tiles) {
+  int slice_col_par = (iters * cta_block) / k_tiles;
+  int slice_row = (iters * cta_block) % k_tiles;
+  int slice_iters =
+      iters * (cta_block + 1) - (k_tiles * slice_col_par + slice_row);
+  if (slice_iters < 0 || slice_col_par >= part2_mn_tiles) {
+    return 0;
+  }
+  if (slice_row + slice_iters > k_tiles) {
+    slice_iters = k_tiles - slice_row;
+  }
+  if (slice_iters == 0) {
+    return 0;
+  }
+
+  int slice_count = 1;
+  int col_first = iters * div_ceil(k_tiles * slice_col_par, iters);
+  if (col_first <= k_tiles * (slice_col_par + 1)) {
+    int col_off = col_first - k_tiles * slice_col_par;
+    slice_count = div_ceil(k_tiles - col_off, iters);
+    if (col_off > 0) {
+      slice_count++;
+    }
+  }
+  return slice_count;
+}
+
+struct Part2SliceStats {
+  int active_blocks = 0;
+  int slice_eq_2 = 0;
+  int slice_gt_2 = 0;
+};
+
+inline Part2SliceStats simulate_part2_slice_stats(int logical_blocks,
+                                                    int k_tiles, int iters,
+                                                    int part2_mn_tiles) {
+  Part2SliceStats stats{};
+  for (int cta_block = 0; cta_block < logical_blocks; ++cta_block) {
+    int slice_count =
+        part2_first_slice_count(cta_block, k_tiles, iters, part2_mn_tiles);
+    if (slice_count <= 0) {
+      continue;
+    }
+    stats.active_blocks++;
+    if (slice_count == 2) {
+      stats.slice_eq_2++;
+    } else if (slice_count > 2) {
+      stats.slice_gt_2++;
+    }
+  }
+  return stats;
+}
+
 struct ClusterLaunchPlan {
   bool use_cluster = false;
   int cluster_size = 1;
@@ -75,6 +131,83 @@ struct ClusterLaunchPlan {
 };
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+
+inline bool env_flag_enabled(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] == '1';
+}
+
+// Whole-grid clusterDim=2 launch taxes Part1 GEMM and every CTA. Microbench
+// shows isolated DSMEM reduce is not faster than atomic. Only opt in when
+// explicitly requested for experiments (not production).
+inline bool allow_whole_kernel_cluster_launch() {
+  return env_flag_enabled("MARLIN_MOE_WHOLE_KERNEL_CLUSTER");
+}
+
+// Minimum fraction of Part2-active CTAs that hit slice_count==2 before we even
+// consider whole-kernel cluster launch (still gated by allow_* above).
+constexpr float kMinSliceEq2Fraction = 0.80f;
+
+inline bool cluster_roi_allows_whole_kernel_launch(
+    const Part2SliceStats& stats) {
+  if (stats.active_blocks <= 0) {
+    return false;
+  }
+  float eq2_frac =
+      static_cast<float>(stats.slice_eq_2) /
+      static_cast<float>(stats.active_blocks);
+  return eq2_frac >= kMinSliceEq2Fraction && stats.slice_gt_2 == 0;
+}
+
+struct ClusterLaunchCache {
+  MarlinFuncPtr kernel = nullptr;
+  int num_threads = 0;
+  int max_shared_mem = 0;
+  int max_cluster = 0;
+  bool non_portable_attr_set = false;
+};
+
+inline ClusterLaunchCache& cluster_launch_cache() {
+  static ClusterLaunchCache cache{};
+  return cache;
+}
+
+inline int query_max_cluster_size(MarlinFuncPtr kernel, int num_threads,
+                                  int max_shared_mem) {
+  auto& cache = cluster_launch_cache();
+  if (cache.kernel == kernel && cache.num_threads == num_threads &&
+      cache.max_shared_mem == max_shared_mem && cache.max_cluster > 0) {
+    return cache.max_cluster;
+  }
+
+  int max_cluster = 0;
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
+  cudaLaunchConfig_t occ_cfg{};
+  occ_cfg.blockDim = num_threads;
+  occ_cfg.dynamicSmemBytes = max_shared_mem;
+  if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) !=
+      cudaSuccess) {
+    max_cluster = 0;
+  }
+#endif
+
+  cache.kernel = kernel;
+  cache.num_threads = num_threads;
+  cache.max_shared_mem = max_shared_mem;
+  cache.max_cluster = max_cluster;
+  return max_cluster;
+}
+
+inline void ensure_non_portable_cluster_attr(MarlinFuncPtr kernel) {
+  auto& cache = cluster_launch_cache();
+  if (cache.non_portable_attr_set && cache.kernel == kernel) {
+    return;
+  }
+  cudaFuncSetAttribute(kernel,
+                       cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+  cache.kernel = kernel;
+  cache.non_portable_attr_set = true;
+}
 
 inline ClusterLaunchPlan compute_cluster_launch_plan(
     int major_capability, int parallel_padded, int prob_k, int prob_n,
@@ -87,9 +220,7 @@ inline ClusterLaunchPlan compute_cluster_launch_plan(
   plan.use_atomic_add = use_atomic_add_in;
   plan.use_fp32_reduce = use_fp32_reduce_in;
 
-  const char* disable_cluster_env =
-      std::getenv("MARLIN_MOE_DISABLE_CLUSTER_REDUCE");
-  if (disable_cluster_env != nullptr && disable_cluster_env[0] == '1') {
+  if (env_flag_enabled("MARLIN_MOE_DISABLE_CLUSTER_REDUCE")) {
     return plan;
   }
   if (major_capability < 9) {
@@ -101,18 +232,18 @@ inline ClusterLaunchPlan compute_cluster_launch_plan(
     return plan;
   }
 
+  // Production default: normal launch + atomic reduce (same as non-cluster).
+  // Whole-kernel cluster launch is opt-in only and still ROI-gated.
+  if (!allow_whole_kernel_cluster_launch()) {
+    return plan;
+  }
+
   int cluster_size = 2;
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
-  cudaLaunchConfig_t occ_cfg{};
-  occ_cfg.blockDim = num_threads;
-  occ_cfg.dynamicSmemBytes = max_shared_mem;
-  int max_cluster = 0;
-  if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) ==
-          cudaSuccess &&
-      max_cluster > 0) {
+  int max_cluster =
+      query_max_cluster_size(kernel, num_threads, max_shared_mem);
+  if (max_cluster > 0) {
     cluster_size = std::min(max_cluster, cluster_size);
   }
-#endif
   if (cluster_size <= 1 || logical_blocks % cluster_size != 0) {
     return plan;
   }
@@ -125,11 +256,26 @@ inline ClusterLaunchPlan compute_cluster_launch_plan(
     return plan;
   }
 
+  Part2SliceStats stats = simulate_part2_slice_stats(
+      logical_blocks, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
+  if (!cluster_roi_allows_whole_kernel_launch(stats)) {
+    if (env_flag_enabled("MARLIN_MOE_CLUSTER_DEBUG")) {
+      fprintf(stderr,
+              "[Marlin MoE cluster] skip whole-kernel cluster: "
+              "active=%d eq2=%d gt2=%d (need eq2>=%.0f%%, gt2=0)\n",
+              stats.active_blocks, stats.slice_eq_2, stats.slice_gt_2,
+              kMinSliceEq2Fraction * 100.0f);
+    }
+    return plan;
+  }
+
   plan.use_cluster = true;
   plan.cluster_size = cluster_size;
   plan.launch_blocks = logical_blocks;
-  plan.use_atomic_add = false;
-  plan.use_fp32_reduce = false;
+  // Keep atomic enabled: slice_count!=2 and cluster failure fall back to atomic
+  // without forcing lock+global reduce.
+  plan.use_atomic_add = use_atomic_add_in;
+  plan.use_fp32_reduce = use_fp32_reduce_in;
   return plan;
 }
 
@@ -152,8 +298,7 @@ inline void launch_marlin_moe_kernel(
   constexpr bool kUseClusterReduce = UseClusterReduce;
 
   if constexpr (UseClusterReduce) {
-    cudaFuncSetAttribute(kernel,
-                         cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    ensure_non_portable_cluster_attr(kernel);
     cudaLaunchConfig_t config{};
     config.gridDim = plan.launch_blocks;
     config.blockDim = num_threads;
