@@ -562,15 +562,49 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   use_fp32_reduce = cluster_plan.use_fp32_reduce;
   blocks = cluster_plan.launch_blocks;
 
+  marlin_moe_host::TailClusterPlan tail_plan =
+      marlin_moe_host::compute_tail_cluster_plan(
+          major_capability, parallel_padded, prob_k, prob_n, thread_k_blocks,
+          thread_n_blocks, logical_blocks, thread_m_blocks, m_block_size_8,
+          is_a_8bit, c_type.id(), num_threads);
+
+  float* cluster_partials_ptr = nullptr;
+  int* cluster_cta_pair_id_ptr = nullptr;
+  int* cluster_tail_meta_ptr = nullptr;
+  if (tail_plan.use_tail_cluster) {
+    const size_t partial_elems =
+        static_cast<size_t>(tail_plan.num_pairs) * 2 *
+        static_cast<size_t>(tail_plan.num_floats);
+    cudaMallocAsync(&cluster_partials_ptr, partial_elems * sizeof(float),
+                    stream);
+    cudaMallocAsync(&cluster_cta_pair_id_ptr,
+                    static_cast<size_t>(logical_blocks) * sizeof(int), stream);
+    cudaMallocAsync(&cluster_tail_meta_ptr,
+                    static_cast<size_t>(tail_plan.num_pairs) * 2 * sizeof(int),
+                    stream);
+    cudaMemcpyAsync(cluster_cta_pair_id_ptr, tail_plan.cta_pair_id.data(),
+                    static_cast<size_t>(logical_blocks) * sizeof(int),
+                    cudaMemcpyHostToDevice, stream);
+  }
+
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
-  marlin_moe_host::dispatch_marlin_moe_launch(
-      kernel, cluster_plan, num_threads, max_shared_mem, stream, A_ptr, B_ptr,
-      C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
-      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
-      prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+  marlin_moe_host::dispatch_marlin_moe_launch_and_tail(
+      kernel, cluster_plan, tail_plan, num_threads, max_shared_mem, stream,
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr,
+      zp_ptr, g_idx_ptr, sorted_token_ids_ptr, expert_ids_ptr,
+      num_tokens_past_padded_ptr, topk_weights_ptr, top_k, mul_topk_weights,
+      num_groups, prob_m, prob_n, prob_k, locks, has_bias, use_atomic_add,
+      use_fp32_reduce, cluster_partials_ptr, cluster_cta_pair_id_ptr,
+      cluster_tail_meta_ptr, c_type.id(), thread_m_blocks, thread_n_blocks,
+      m_block_size_8, is_a_8bit, moe_block_size, top_k);
   // clang-format on
+
+  if (cluster_partials_ptr != nullptr) {
+    cudaFreeAsync(cluster_partials_ptr, stream);
+    cudaFreeAsync(cluster_cta_pair_id_ptr, stream);
+    cudaFreeAsync(cluster_tail_meta_ptr, stream);
+  }
 }
 
 }  // namespace MARLIN_NAMESPACE_NAME

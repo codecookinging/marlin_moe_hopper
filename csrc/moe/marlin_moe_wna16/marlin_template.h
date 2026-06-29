@@ -81,7 +81,11 @@ __global__ void Marlin(
     int* locks,             // extra global storage for barrier synchronization
     bool use_atomic_add,       // whether to use atomic add to reduce
     bool use_fp32_reduce,      // whether to use fp32 global reduce
-    bool use_cluster_reduce    // whether to use Hopper cluster DSMEM reduce
+    bool use_cluster_reduce,   // whether to use Hopper cluster DSMEM reduce
+    float* cluster_partials,   // deferred tail partials (Phase 2)
+    const int* cluster_cta_pair_id,
+    const int* cluster_tail_meta,
+    bool use_tail_cluster_reduce
 ) {}
 
 }  // namespace MARLIN_NAMESPACE_NAME
@@ -286,7 +290,11 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,  // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    bool use_cluster_reduce  // whether to use Hopper cluster DSMEM reduce
+    bool use_cluster_reduce,  // whether to use Hopper cluster DSMEM reduce
+    float* __restrict__ cluster_partials,
+    const int* __restrict__ cluster_cta_pair_id,
+    const int* __restrict__ cluster_tail_meta,
+    bool use_tail_cluster_reduce
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -615,7 +623,9 @@ __global__ void Marlin(
     }
 
     if (first_init && slice_count > 1 && slice_idx == 0 &&
-        (use_atomic_add || use_cluster_reduce)) {
+        (use_atomic_add || use_cluster_reduce) &&
+        !(use_tail_cluster_reduce && cluster_cta_pair_id != nullptr &&
+          cluster_cta_pair_id[cta_block] >= 0)) {
       constexpr int threads_per_m = 16 * thread_n_blocks / 8;
       int m_per_thread =
           div_ceil(block_num_valid_tokens, threads / threads_per_m);
@@ -2231,8 +2241,33 @@ __global__ void Marlin(
 
       bool cluster_reduced = false;
       bool atomic_fallback = use_atomic_add;
+      bool defer_tail_cluster = false;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-      if (use_cluster_reduce && in_part2 && slice_count == 2) {
+      if (use_tail_cluster_reduce && in_part2 && slice_count == 2 &&
+          cluster_cta_pair_id != nullptr && cluster_partials != nullptr) {
+        int pair_id = cluster_cta_pair_id[cta_block];
+        if (pair_id >= 0) {
+          defer_tail_cluster = true;
+          constexpr int cluster_num_floats =
+              thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
+          float* dst = cluster_partials +
+                       (static_cast<int64_t>(pair_id) * 2 +
+                        static_cast<int64_t>(slice_idx)) *
+                           cluster_num_floats;
+          float* src = reinterpret_cast<float*>(&frag_c);
+          for (int i = threadIdx.x; i < cluster_num_floats; i += blockDim.x) {
+            dst[i] = src[i];
+          }
+          __syncthreads();
+          if (slice_idx == 0 && threadIdx.x == 0 &&
+              cluster_tail_meta != nullptr) {
+            cluster_tail_meta[pair_id * 2 + 0] = block_id;
+            cluster_tail_meta[pair_id * 2 + 1] = slice_col;
+          }
+        }
+      }
+      if (!defer_tail_cluster && use_cluster_reduce && in_part2 &&
+          slice_count == 2) {
         constexpr int cluster_num_floats =
             thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
         marlin_hopper::ClusterReduceStatus cluster_status =
@@ -2255,12 +2290,13 @@ __global__ void Marlin(
         } else {
           atomic_fallback = true;
         }
-      } else if (use_cluster_reduce && in_part2 && slice_count > 1) {
+      } else if (!defer_tail_cluster && use_cluster_reduce && in_part2 &&
+                 slice_count > 1) {
         atomic_fallback = true;
       }
 #endif
 
-      if (!cluster_reduced) {
+      if (!defer_tail_cluster && !cluster_reduced) {
         if (slice_count > 1 && !atomic_fallback) {
           // lock+global reduce: only when atomic/cluster paths are disabled
           // (e.g. MARLIN_MOE_FORCE_LOCK_REDUCE debugging).

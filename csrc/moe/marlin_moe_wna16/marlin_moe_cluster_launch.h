@@ -2,11 +2,15 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 #include <cuda_runtime.h>
 
 #include "kernel.h"
+#include "marlin_moe_cluster_tail.h"
+#include "core/scalar_type.hpp"
 
 namespace marlin_moe_host {
 
@@ -121,6 +125,13 @@ inline Part2SliceStats simulate_part2_slice_stats(int logical_blocks,
   return stats;
 }
 
+struct TailClusterPlan {
+  bool use_tail_cluster = false;
+  int num_pairs = 0;
+  int num_floats = 0;
+  std::vector<int32_t> cta_pair_id;
+};
+
 struct ClusterLaunchPlan {
   bool use_cluster = false;
   int cluster_size = 1;
@@ -209,6 +220,84 @@ inline void ensure_non_portable_cluster_attr(MarlinFuncPtr kernel) {
   cache.non_portable_attr_set = true;
 }
 
+inline TailClusterPlan compute_tail_cluster_plan(
+    int major_capability, int parallel_padded, int prob_k, int prob_n,
+    int thread_k_blocks, int thread_n_blocks, int logical_blocks,
+    int thread_m_blocks, bool m_block_size_8, bool is_a_8bit,
+    vllm::ScalarTypeId c_type_id, int num_threads) {
+  TailClusterPlan plan{};
+  if (env_flag_enabled("MARLIN_MOE_DISABLE_CLUSTER_REDUCE") ||
+      env_flag_enabled("MARLIN_MOE_DISABLE_TAIL_CLUSTER_REDUCE")) {
+    return plan;
+  }
+  if (major_capability < 9) {
+    return plan;
+  }
+  if (thread_m_blocks != 1 || m_block_size_8 || is_a_8bit) {
+    return plan;
+  }
+  if (!needs_part2_streamk_tail(parallel_padded, prob_k, prob_n,
+                                thread_k_blocks, thread_n_blocks,
+                                logical_blocks)) {
+    return plan;
+  }
+
+  StreamKHostParams sk = compute_streamk_host_params(
+      parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
+      logical_blocks);
+  if (!can_use_identity_pair_cluster(logical_blocks, 2, sk.k_tiles, sk.iters,
+                                     sk.part2_mn_tiles)) {
+    return plan;
+  }
+
+  plan.num_floats = thread_m_blocks * (is_a_8bit ? 2 : 4) * 2 * 4;
+  plan.cta_pair_id.assign(logical_blocks, -1);
+
+  int b = 0;
+  while (b < logical_blocks) {
+    int group_key = (sk.iters * b) / sk.k_tiles;
+    int end = b + 1;
+    while (end < logical_blocks &&
+           (sk.iters * end) / sk.k_tiles == group_key) {
+      ++end;
+    }
+    if (end - b == 2) {
+      int sc0 =
+          part2_first_slice_count(b, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
+      int sc1 = part2_first_slice_count(b + 1, sk.k_tiles, sk.iters,
+                                        sk.part2_mn_tiles);
+      if (sc0 == 2 && sc1 == 2) {
+        int pair_id = plan.num_pairs++;
+        plan.cta_pair_id[b] = pair_id;
+        plan.cta_pair_id[b + 1] = pair_id;
+      }
+    }
+    b = end;
+  }
+
+  if (plan.num_pairs <= 0) {
+    return plan;
+  }
+
+  const bool tail_dispatch_ok =
+      (c_type_id == vllm::kBFloat16.id() || c_type_id == vllm::kFloat16.id()) &&
+      plan.num_floats == 32 && num_threads == 256 &&
+      (thread_n_blocks == 8 || thread_n_blocks == 4);
+  if (!tail_dispatch_ok) {
+    plan.num_pairs = 0;
+    plan.cta_pair_id.assign(logical_blocks, -1);
+    return plan;
+  }
+
+  plan.use_tail_cluster = true;
+  if (env_flag_enabled("MARLIN_MOE_CLUSTER_DEBUG")) {
+    fprintf(stderr,
+            "[Marlin MoE tail cluster] enable pairs=%d floats=%d blocks=%d\n",
+            plan.num_pairs, plan.num_floats, logical_blocks);
+  }
+  return plan;
+}
+
 inline ClusterLaunchPlan compute_cluster_launch_plan(
     int major_capability, int parallel_padded, int prob_k, int prob_n,
     int thread_k_blocks, int thread_n_blocks, int logical_blocks,
@@ -291,7 +380,9 @@ inline void launch_marlin_moe_kernel(
     const int32_t* expert_ids_ptr, const int32_t* num_tokens_past_padded_ptr,
     const float* topk_weights_ptr, int top_k, bool mul_topk_weights,
     int num_groups, int prob_m, int prob_n, int prob_k, int* locks,
-    bool has_bias, bool use_atomic_add, bool use_fp32_reduce) {
+    bool has_bias, bool use_atomic_add, bool use_fp32_reduce,
+    float* cluster_partials, const int* cluster_cta_pair_id,
+    const int* cluster_tail_meta, bool use_tail_cluster_reduce) {
   static_assert(UseClusterReduce == true || UseClusterReduce == false,
                 "UseClusterReduce must be a compile-time boolean");
 
@@ -316,14 +407,17 @@ inline void launch_marlin_moe_kernel(
         zp_ptr, g_idx_ptr, sorted_token_ids_ptr, expert_ids_ptr,
         num_tokens_past_padded_ptr, topk_weights_ptr, top_k, mul_topk_weights,
         num_groups, prob_m, prob_n, prob_k, plan.logical_blocks, nullptr,
-        locks, has_bias, use_atomic_add, use_fp32_reduce, kUseClusterReduce);
+        locks, has_bias, use_atomic_add, use_fp32_reduce, kUseClusterReduce,
+        cluster_partials, cluster_cta_pair_id, cluster_tail_meta,
+        use_tail_cluster_reduce);
   } else {
     kernel<<<plan.launch_blocks, num_threads, max_shared_mem, stream>>>(
         A, B, C, C_tmp, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
         prob_k, plan.logical_blocks, nullptr, locks, has_bias, use_atomic_add,
-        use_fp32_reduce, kUseClusterReduce);
+        use_fp32_reduce, kUseClusterReduce, cluster_partials,
+        cluster_cta_pair_id, cluster_tail_meta, use_tail_cluster_reduce);
   }
 }
 
@@ -337,21 +431,60 @@ inline void dispatch_marlin_moe_launch(
     const int32_t* expert_ids_ptr, const int32_t* num_tokens_past_padded_ptr,
     const float* topk_weights_ptr, int top_k, bool mul_topk_weights,
     int num_groups, int prob_m, int prob_n, int prob_k, int* locks,
-    bool has_bias, bool use_atomic_add, bool use_fp32_reduce) {
+    bool has_bias, bool use_atomic_add, bool use_fp32_reduce,
+    float* cluster_partials, const int* cluster_cta_pair_id,
+    const int* cluster_tail_meta, bool use_tail_cluster_reduce) {
   if (plan.use_cluster) {
     launch_marlin_moe_kernel<true>(
         kernel, plan, num_threads, max_shared_mem, stream, A, B, C, C_tmp,
         bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
-        prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+        prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+        cluster_partials, cluster_cta_pair_id, cluster_tail_meta,
+        use_tail_cluster_reduce);
   } else {
     launch_marlin_moe_kernel<false>(
         kernel, plan, num_threads, max_shared_mem, stream, A, B, C, C_tmp,
         bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
         sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
         topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
-        prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce);
+        prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+        cluster_partials, cluster_cta_pair_id, cluster_tail_meta,
+        use_tail_cluster_reduce);
+  }
+}
+
+template <typename MarlinFuncPtrT>
+inline void dispatch_marlin_moe_launch_and_tail(
+    MarlinFuncPtrT kernel, const ClusterLaunchPlan& plan,
+    const TailClusterPlan& tail_plan, int num_threads, int max_shared_mem,
+    cudaStream_t stream, const int4* A, const int4* B, int4* C, int4* C_tmp,
+    const int4* bias_ptr, const float* a_s_ptr, const int4* b_s_ptr,
+    const float* g_s_ptr, const int4* zp_ptr, const int* g_idx_ptr,
+    const int32_t* sorted_token_ids_ptr, const int32_t* expert_ids_ptr,
+    const int32_t* num_tokens_past_padded_ptr, const float* topk_weights_ptr,
+    int top_k, bool mul_topk_weights, int num_groups, int prob_m, int prob_n,
+    int prob_k, int* locks, bool has_bias, bool use_atomic_add,
+    bool use_fp32_reduce, float* cluster_partials,
+    const int* cluster_cta_pair_id, const int* cluster_tail_meta,
+    vllm::ScalarTypeId c_type_id, int thread_m_blocks, int thread_n_blocks,
+    bool m_block_size_8, bool is_a_8bit, int moe_block_size, int top_k) {
+  const bool use_tail = tail_plan.use_tail_cluster && cluster_partials != nullptr;
+  dispatch_marlin_moe_launch(
+      kernel, plan, num_threads, max_shared_mem, stream, A, B, C, C_tmp,
+      bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m, prob_n,
+      prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+      cluster_partials, cluster_cta_pair_id, cluster_tail_meta, use_tail);
+  if (use_tail) {
+    dispatch_marlin_moe_cluster_tail(
+        c_type_id, thread_m_blocks, thread_n_blocks, num_threads,
+        m_block_size_8, is_a_8bit, tail_plan.num_floats, cluster_partials,
+        cluster_tail_meta, C, sorted_token_ids_ptr, topk_weights_ptr, prob_m,
+        prob_n, top_k, moe_block_size, mul_topk_weights, tail_plan.num_pairs,
+        stream);
   }
 }
 

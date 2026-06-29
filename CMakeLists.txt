@@ -162,7 +162,9 @@ marlin_configure_cuda_sources(
   WITH_STATIC_TEMPLATE_STUB_WORKAROUND)
 list(APPEND MARLIN_V100_MOE_SRC ${MARLIN_MOE_KERNEL_SRC})
 
-set(MARLIN_MOE_OTHER_SRC "csrc/moe/marlin_moe_wna16/ops.cu")
+set(MARLIN_MOE_OTHER_SRC
+  "csrc/moe/marlin_moe_wna16/ops.cu"
+  "csrc/moe/marlin_moe_wna16/marlin_moe_cluster_tail.cu")
 marlin_configure_cuda_sources(
   SRCS "${MARLIN_MOE_OTHER_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}"
