@@ -45,7 +45,7 @@ def parse_cmake_args(raw_args: str) -> list[str]:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".") -> None:
-        super().__init__(name, sources=[], py_limited_api=True)
+        super().__init__(name, sources=[])
         self.cmake_lists_dir = str((ROOT_DIR / cmake_lists_dir).resolve())
 
 
