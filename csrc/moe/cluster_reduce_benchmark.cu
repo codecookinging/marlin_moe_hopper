@@ -44,12 +44,12 @@ __device__ __forceinline__ void bench_wait_negative_and_add(int* lock) {
 template <int NumFloats, int NumThreads>
 __device__ __forceinline__ void load_partial(const float* partials, int pair_id,
                                              int slice_idx, float* frag_c) {
-  const float* src = partials + (pair_id * 2 + slice_idx) * NumFloats;
+  const float* src = partials + (pair_id * 2 + slice_idx) * (NumFloats * NumThreads);
   constexpr int Vecs = NumFloats / 4;
   float4* dst4 = reinterpret_cast<float4*>(frag_c);
   const float4* src4 = reinterpret_cast<const float4*>(src);
-  if (threadIdx.x < Vecs) {
-    dst4[threadIdx.x] = src4[threadIdx.x];
+  for (int i = 0; i < Vecs; ++i) {
+    dst4[i] = src4[i * NumThreads + threadIdx.x];
   }
   __syncthreads();
 }
@@ -57,12 +57,12 @@ __device__ __forceinline__ void load_partial(const float* partials, int pair_id,
 template <int NumFloats, int NumThreads>
 __device__ __forceinline__ void store_result(float* output, int pair_id,
                                              const float* frag_c) {
-  float* dst = output + pair_id * NumFloats;
+  float* dst = output + pair_id * (NumFloats * NumThreads);
   constexpr int Vecs = NumFloats / 4;
   float4* dst4 = reinterpret_cast<float4*>(dst);
   const float4* src4 = reinterpret_cast<const float4*>(frag_c);
-  if (threadIdx.x < Vecs) {
-    dst4[threadIdx.x] = src4[threadIdx.x];
+  for (int i = 0; i < Vecs; ++i) {
+    dst4[i * NumThreads + threadIdx.x] = src4[i];
   }
 }
 
@@ -81,7 +81,7 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
 
   float frag_c[NumFloats];
   int* lock = locks + pair_id;
-  float* out_base = output + pair_id * NumFloats;
+  float* out_base = output + pair_id * (NumFloats * NumThreads);
 
   for (int iter = 0; iter < iters; ++iter) {
     load_partial<NumFloats, NumThreads>(partials, pair_id, slice_idx, frag_c);
@@ -90,8 +90,8 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
       constexpr int Vecs = NumFloats / 4;
       float4* out4 = reinterpret_cast<float4*>(out_base);
       const float4 zero = make_float4(0.f, 0.f, 0.f, 0.f);
-      if (threadIdx.x < Vecs) {
-        out4[threadIdx.x] = zero;
+      for (int i = 0; i < Vecs; ++i) {
+        out4[i * NumThreads + threadIdx.x] = zero;
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -109,12 +109,12 @@ __global__ void atomic_streamk_reduce_bench_kernel(float* __restrict__ output,
     constexpr int Vecs = NumFloats / 4;
     float4* frag4 = reinterpret_cast<float4*>(frag_c);
     float4* out4 = reinterpret_cast<float4*>(out_base);
-    if (threadIdx.x < Vecs) {
-      float4 v = frag4[threadIdx.x];
-      atomicAdd(reinterpret_cast<float*>(&out4[threadIdx.x].x), v.x);
-      atomicAdd(reinterpret_cast<float*>(&out4[threadIdx.x].y), v.y);
-      atomicAdd(reinterpret_cast<float*>(&out4[threadIdx.x].z), v.z);
-      atomicAdd(reinterpret_cast<float*>(&out4[threadIdx.x].w), v.w);
+    for (int i = 0; i < Vecs; ++i) {
+      float4 v = frag4[i];
+      atomicAdd(reinterpret_cast<float*>(&out4[i * NumThreads + threadIdx.x].x), v.x);
+      atomicAdd(reinterpret_cast<float*>(&out4[i * NumThreads + threadIdx.x].y), v.y);
+      atomicAdd(reinterpret_cast<float*>(&out4[i * NumThreads + threadIdx.x].z), v.z);
+      atomicAdd(reinterpret_cast<float*>(&out4[i * NumThreads + threadIdx.x].w), v.w);
     }
     __syncthreads();
   }
@@ -173,7 +173,7 @@ void launch_cluster_bench(float* output, const float* partials, int num_pairs,
 
   const int cluster_size = 2;
   const int blocks = num_pairs * cluster_size;
-  const int smem = NumFloats * sizeof(float);
+  const int smem = NumFloats * NumThreads * sizeof(float);
 
   cudaLaunchConfig_t config{};
   config.gridDim = blocks;
@@ -249,9 +249,9 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
                             bool run_verify, at::Device device) {
   auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
 
-  auto partials = torch::randn({num_pairs, 2, NumFloats}, options);
-  auto output_atomic = torch::zeros({num_pairs, NumFloats}, options);
-  auto output_cluster = torch::zeros({num_pairs, NumFloats}, options);
+  auto partials = torch::randn({num_pairs, 2, NumFloats * NumThreads}, options);
+  auto output_atomic = torch::zeros({num_pairs, NumFloats * NumThreads}, options);
+  auto output_cluster = torch::zeros({num_pairs, NumFloats * NumThreads}, options);
   auto locks = torch::zeros({num_pairs}, options.dtype(torch::kInt32));
 
   const float* partials_ptr = partials.data_ptr<float>();
@@ -265,14 +265,14 @@ at::Tensor run_one_config(int num_pairs, int warmup_iters, int bench_iters,
 
   auto launch_atomic_chunk = [&](int pair_off, int pairs_in_chunk, int iters) {
     launch_atomic_bench<NumFloats, NumThreads>(
-        out_atomic_ptr + pair_off * NumFloats,
-        partials_ptr + pair_off * 2 * NumFloats, locks_ptr + pair_off,
+        out_atomic_ptr + pair_off * (NumFloats * NumThreads),
+        partials_ptr + pair_off * 2 * (NumFloats * NumThreads), locks_ptr + pair_off,
         pairs_in_chunk, iters, stream);
   };
   auto launch_cluster_chunk = [&](int pair_off, int pairs_in_chunk, int iters) {
     launch_cluster_bench<NumFloats, NumThreads>(
-        out_cluster_ptr + pair_off * NumFloats,
-        partials_ptr + pair_off * 2 * NumFloats, pairs_in_chunk, iters, stream);
+        out_cluster_ptr + pair_off * (NumFloats * NumThreads),
+        partials_ptr + pair_off * 2 * (NumFloats * NumThreads), pairs_in_chunk, iters, stream);
   };
 
   // One reduce per launch keeps concurrent follower spinners bounded (per chunk)

@@ -12,6 +12,8 @@ macro (find_python_from_executable EXECUTABLE SUPPORTED_VERSIONS)
   endif()
   set(_VER "${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}")
   set(_SUPPORTED_VERSIONS_LIST ${SUPPORTED_VERSIONS} ${ARGN})
+  # Temporarily allow python 3.9 for benchmark
+  list(APPEND _SUPPORTED_VERSIONS_LIST "3.9")
   if (NOT _VER IN_LIST _SUPPORTED_VERSIONS_LIST)
     message(FATAL_ERROR
       "Python version (${_VER}) is not one of the supported versions: "
