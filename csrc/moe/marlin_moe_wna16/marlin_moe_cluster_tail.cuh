@@ -2,6 +2,10 @@
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
 
+#ifndef MARLIN_NAMESPACE_NAME
+#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
+#endif
+
 #include <cooperative_groups.h>
 
 #include "marlin_hopper.cuh"
@@ -12,14 +16,14 @@ namespace marlin_moe_tail {
 __device__ inline int div_ceil(int a, int b) { return (a + b - 1) / b; }
 
 // Tail write for thread_m_blocks=1, !m_block_size_8, !is_a_8bit (GLM-5 path).
-template <vllm::ScalarTypeId c_type_id, int thread_n_blocks, int NumThreads>
+template <const vllm::ScalarTypeId c_type_id, int thread_n_blocks, int NumThreads>
 __device__ void tail_write_m1_n4(float* frag_c, int4* sh_red, int4* C,
                                  const int32_t* sorted_token_ids_ptr,
                                  int block_id, int slice_col, int prob_n,
                                  int prob_m, int top_k, int moe_block_size,
                                  bool mul_topk_weights,
                                  const float* topk_weights_ptr) {
-  using Cdtype = MarlinScalarType<c_type_id>;
+  using Cdtype = MARLIN_NAMESPACE_NAME::MarlinScalarType<c_type_id>;
   using c_scalar_t = typename Cdtype::scalar_t;
   using c_scalar_t2 = typename Cdtype::scalar_t2;
 
@@ -88,9 +92,9 @@ __device__ void tail_write_m1_n4(float* frag_c, int4* sh_red, int4* C,
       c_scalar_t2* sh_red_half2 =
           reinterpret_cast<c_scalar_t2*>(&sh_red[c_sh_rd]);
       if (mul_topk_weights) {
-        c_scalar_t2 topk_weight_score = Cdtype::nums2num2(
-            Cdtype::float2num(topk_weights_ptr[sorted_row]),
-            Cdtype::float2num(topk_weights_ptr[sorted_row]));
+        float topk_weight_tmp = topk_weights_ptr[sorted_row];
+        c_scalar_t2 topk_weight_score =
+            Cdtype::num2num2(Cdtype::float2num(topk_weight_tmp));
 #pragma unroll
         for (int a = 0; a < 4; a++) {
           sh_red_half2[a] = __hmul2(sh_red_half2[a], topk_weight_score);
@@ -103,7 +107,7 @@ __device__ void tail_write_m1_n4(float* frag_c, int4* sh_red, int4* C,
   }
 }
 
-template <vllm::ScalarTypeId c_type_id, int thread_n_blocks, int NumThreads,
+template <const vllm::ScalarTypeId c_type_id, int thread_n_blocks, int NumThreads,
           int NumFloats>
 __global__ void marlin_moe_cluster_tail_kernel(
     float* __restrict__ cluster_partials,

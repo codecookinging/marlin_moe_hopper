@@ -1,3 +1,7 @@
+#ifndef MARLIN_NAMESPACE_NAME
+#define MARLIN_NAMESPACE_NAME marlin_moe_wna16
+#endif
+
 #include "marlin_moe_cluster_tail.cuh"
 
 #include <algorithm>
@@ -14,7 +18,7 @@ inline int tail_smem_bytes(int thread_n_blocks, int num_floats) {
   return std::max(sh_red, sh_pack);
 }
 
-template <vllm::ScalarTypeId c_type_id, int thread_n_blocks, int num_threads,
+template <const vllm::ScalarTypeId c_type_id, int thread_n_blocks, int num_threads,
           int num_floats>
 void launch_tail_kernel(float* partials, const int* tail_meta, int4* C,
                         const int32_t* sorted_token_ids,
