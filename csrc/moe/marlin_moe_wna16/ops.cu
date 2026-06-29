@@ -504,7 +504,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   static int cached_max_shared_mem = 0;
   static int cached_major_capability = 0;
   static int cached_minor_capability = 0;
-  static int cached_sms = 0;
   
   if (cached_max_shared_mem == 0) {
     cudaDeviceGetAttribute(&cached_max_shared_mem,
@@ -513,13 +512,13 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                            dev);
     cudaDeviceGetAttribute(&cached_minor_capability, cudaDevAttrComputeCapabilityMinor,
                            dev);
-    cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev);
   }
   
   int max_shared_mem = cached_max_shared_mem;
   int major_capability = cached_major_capability;
   int minor_capability = cached_minor_capability;
-  int sms = cached_sms;
+  // We already have sms passed as an argument to moe_wna16_marlin_gemm, so we don't need to fetch it here.
+  // int sms = cached_sms;
 
   TORCH_CHECK(max_shared_mem > 0);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
@@ -1046,13 +1045,13 @@ torch::Tensor moe_wna16_marlin_gemm(
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
   int parallel_padded = num_tokens_past_padded_count / (int)moe_block_size;
-  int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
+  int min_workspace_size = min(max_n_tiles * parallel_padded, cached_sms * 4);
 
   int dev = a.get_device();
   
   // We already fetched major_capability via cache earlier in the function
   
-  if (!use_cluster_reduce || major_capability < 9) {
+  if (!use_cluster_reduce || cached_major_capability < 9) {
     use_cluster_reduce = false;
     if (!force_lock_reduce) {
       use_atomic_add = true;
@@ -1060,7 +1059,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   if (use_cluster_reduce) {
     // We assume blocks_per_sm is at most 2 for cluster reduce sizing
-    int max_logical_blocks = sms * 2;
+    int max_logical_blocks = cached_sms * 2;
     min_workspace_size += max_logical_blocks * 2;
   }
 
@@ -1088,7 +1087,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-      thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
+      thread_k, thread_n, cached_sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
       is_zp_float, num_tokens_past_padded_count, use_cluster_reduce);
 
   return c;
