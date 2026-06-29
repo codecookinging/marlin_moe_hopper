@@ -1045,13 +1045,13 @@ torch::Tensor moe_wna16_marlin_gemm(
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
   int parallel_padded = num_tokens_past_padded_count / (int)moe_block_size;
-  int min_workspace_size = min(max_n_tiles * parallel_padded, cached_sms * 4);
+  int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
 
   int dev = a.get_device();
   
   // We already fetched major_capability via cache earlier in the function
   
-  if (!use_cluster_reduce || cached_major_capability < 9) {
+  if (!use_cluster_reduce) {
     use_cluster_reduce = false;
     if (!force_lock_reduce) {
       use_atomic_add = true;
