@@ -101,25 +101,61 @@ def _benchmark_schema_has_device_guard() -> bool:
     return "device_guard" in _benchmark_schema_text()
 
 
-def benchmark_streamk_reduce(*args, **kwargs) -> torch.Tensor:
+def _benchmark_schema_arg_names() -> list[str]:
+    schema = _get_benchmark_op_schema()
+    if schema is None:
+        return []
+    return [arg.name for arg in schema.arguments]
+
+
+def benchmark_streamk_reduce(
+    num_floats: int,
+    num_threads: int,
+    num_tiles: int | None = None,
+    warmup_iters: int = 20,
+    bench_iters: int = 200,
+    run_verify: bool = True,
+    slices_per_tile: int = 2,
+    in_kernel_iters: bool = False,
+    *,
+    num_pairs: int | None = None,
+    device_guard: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Benchmark cluster vs atomic Stream-K reduce.
+
+    num_tiles: independent output tiles (legacy alias: num_pairs).
+    slices_per_tile: CTAs sharing one output tile (2=cluster comparable).
+    in_kernel_iters: loop reduces inside the kernel (closer to Marlin).
+    """
     _load_moe()
     op = torch.ops._moe_C.benchmark_streamk_reduce
-    has_device_guard = _benchmark_schema_has_device_guard()
+    tiles = num_tiles if num_tiles is not None else num_pairs
+    if tiles is None:
+        raise TypeError("benchmark_streamk_reduce requires num_tiles or num_pairs")
+
+    arg_names = _benchmark_schema_arg_names()
+    has_device_guard = "device_guard" in arg_names or _benchmark_schema_has_device_guard()
+    core: list[object] = [
+        num_floats,
+        num_threads,
+        tiles,
+        warmup_iters,
+        bench_iters,
+        run_verify,
+    ]
+    if "slices_per_tile" in arg_names:
+        core.append(slices_per_tile)
+    if "in_kernel_iters" in arg_names:
+        core.append(in_kernel_iters)
 
     if has_device_guard:
-        if (args and isinstance(args[0], torch.Tensor)) or kwargs.get("device_guard") is not None:
-            return op(*args, **kwargs)
-        device_guard = torch.empty((), device="cuda")
-        return op(device_guard, *args, **kwargs)
+        guard = device_guard if device_guard is not None else torch.empty((), device="cuda")
+        return op(guard, *core)
 
     schema = _benchmark_schema_text()
-    if args or kwargs:
-        raise RuntimeError(
-            "Loaded _moe_C is stale: benchmark_streamk_reduce schema is missing "
-            f"device_guard (schema={schema!r}). Rebuild the extension:\n"
-            "  rm -f python/marlin_v100/_moe_C*.so && "
-            "PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace"
-        )
     raise RuntimeError(
-        "benchmark_streamk_reduce requires arguments; rebuild _moe_C if this persists."
+        "Loaded _moe_C is stale: benchmark_streamk_reduce schema is missing "
+        f"device_guard (schema={schema!r}). Rebuild the extension:\n"
+        "  rm -f python/marlin_v100/_moe_C*.so && "
+        "PYTHONPATH=$PWD/python ./.venv/bin/python setup.py build_ext --inplace"
     )

@@ -122,19 +122,28 @@ def _parse_result(raw: torch.Tensor) -> dict[str, float]:
     values = raw.detach().cpu().tolist()
     num_floats = int(values[0])
     num_threads = int(values[1])
-    atomic_ns_per_pair = float(values[2])
-    cluster_ns_per_pair = float(values[3])
+    atomic_ns_per_tile = float(values[2])
+    cluster_ns_per_tile = float(values[3])
     max_abs_diff = float(values[4])
-    num_pairs = int(values[5])
+    num_tiles = int(values[5])
     atomic_ns_per_launch = float(values[6])
-    cluster_ns_per_launch = cluster_ns_per_pair * num_pairs
-    speedup = atomic_ns_per_pair / cluster_ns_per_pair if cluster_ns_per_pair > 0 else 0.0
+    slices_per_tile = int(values[7]) if len(values) > 7 else 2
+    in_kernel_iters = bool(values[8]) if len(values) > 8 else False
+    cluster_ns_per_launch = cluster_ns_per_tile * num_tiles
+    speedup = (
+        atomic_ns_per_tile / cluster_ns_per_tile if cluster_ns_per_tile > 0 else 0.0
+    )
     return {
         "num_floats": num_floats,
         "num_threads": num_threads,
-        "num_pairs": num_pairs,
-        "atomic_ns_per_pair": atomic_ns_per_pair,
-        "cluster_ns_per_pair": cluster_ns_per_pair,
+        "num_tiles": num_tiles,
+        "num_pairs": num_tiles,
+        "slices_per_tile": slices_per_tile,
+        "in_kernel_iters": in_kernel_iters,
+        "atomic_ns_per_pair": atomic_ns_per_tile,
+        "cluster_ns_per_pair": cluster_ns_per_tile,
+        "atomic_ns_per_tile": atomic_ns_per_tile,
+        "cluster_ns_per_tile": cluster_ns_per_tile,
         "atomic_ns_per_launch": atomic_ns_per_launch,
         "cluster_ns_per_launch": cluster_ns_per_launch,
         "speedup": speedup,
@@ -146,18 +155,24 @@ def run_benchmark(
     *,
     num_floats: int = 32,
     num_threads: int = 256,
-    num_pairs: int = 4096,
+    num_tiles: int | None = None,
+    num_pairs: int | None = None,
     warmup_iters: int = 20,
     bench_iters: int = 200,
     run_verify: bool = True,
+    slices_per_tile: int = 2,
+    in_kernel_iters: bool = False,
 ) -> dict[str, float]:
+    tiles = num_tiles if num_tiles is not None else (num_pairs if num_pairs is not None else 64)
     raw = ops.benchmark_streamk_reduce(
         num_floats,
         num_threads,
-        num_pairs,
+        tiles,
         warmup_iters,
         bench_iters,
         run_verify,
+        slices_per_tile,
+        in_kernel_iters,
     )
     return _parse_result(raw)
 
