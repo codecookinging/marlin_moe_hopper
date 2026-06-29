@@ -4,7 +4,6 @@
 
 #include "marlin_moe_cluster_tail.cuh"
 
-#include <algorithm>
 #include <cuda_runtime.h>
 
 #include "core/scalar_type.hpp"
@@ -13,9 +12,10 @@
 namespace marlin_moe_host {
 
 inline int tail_smem_bytes(int thread_n_blocks, int num_floats) {
-  int sh_red = (2 * thread_n_blocks + 1) * 16 * static_cast<int>(sizeof(int4));
-  int sh_pack = num_floats * static_cast<int>(sizeof(float));
-  return std::max(sh_red, sh_pack);
+  const int sh_red_bytes =
+      (2 * thread_n_blocks + 1) * 16 * static_cast<int>(sizeof(int4));
+  const int sh_pack_bytes = num_floats * static_cast<int>(sizeof(float));
+  return sh_red_bytes + sh_pack_bytes;
 }
 
 template <const vllm::ScalarTypeId c_type_id, int thread_n_blocks, int num_threads,
@@ -37,12 +37,14 @@ void launch_tail_kernel(float* partials, const int* tail_meta, int4* C,
   const int max_cluster =
       query_max_cluster_size_cached(kernel_ptr, num_threads, smem);
   int cluster_size = 2;
-  if (max_cluster > 0) {
-    cluster_size = std::min(max_cluster, cluster_size);
+  if (max_cluster > 0 && max_cluster < cluster_size) {
+    cluster_size = max_cluster;
   }
   if (cluster_size < 2) {
     return;
   }
+  cudaFuncSetAttribute(const_cast<void*>(kernel_ptr),
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
   ensure_non_portable_cluster_attr_cached(kernel_ptr);
   const int blocks = num_pairs * cluster_size;
   cudaLaunchConfig_t config{};
@@ -106,6 +108,13 @@ void dispatch_marlin_moe_cluster_tail(
   if (c_type_id == vllm::kBFloat16.id() && thread_n_blocks == 4 &&
       num_threads == 256 && num_floats == 32) {
     launch_tail_kernel<vllm::kBFloat16.id(), 4, 256, 32>(
+        partials, tail_meta, C, sorted_token_ids, topk_weights, prob_m, prob_n,
+        top_k, moe_block_size, mul_topk_weights, num_pairs, stream);
+    return;
+  }
+  if (c_type_id == vllm::kFloat16.id() && thread_n_blocks == 4 &&
+      num_threads == 256 && num_floats == 32) {
+    launch_tail_kernel<vllm::kFloat16.id(), 4, 256, 32>(
         partials, tail_meta, C, sorted_token_ids, topk_weights, prob_m, prob_n,
         top_k, moe_block_size, mul_topk_weights, num_pairs, stream);
   }

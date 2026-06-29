@@ -1,13 +1,12 @@
 #pragma once
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-
 #ifndef MARLIN_NAMESPACE_NAME
 #define MARLIN_NAMESPACE_NAME marlin_moe_wna16
 #endif
 
 #include <cooperative_groups.h>
 
+#include "core/scalar_type.hpp"
 #include "marlin_hopper.cuh"
 #include "quantization/marlin/marlin_dtypes.cuh"
 
@@ -23,6 +22,7 @@ __device__ void tail_write_m1_n4(float* frag_c, int4* sh_red, int4* C,
                                  int prob_m, int top_k, int moe_block_size,
                                  bool mul_topk_weights,
                                  const float* topk_weights_ptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   using Cdtype = MARLIN_NAMESPACE_NAME::MarlinScalarType<c_type_id>;
   using c_scalar_t = typename Cdtype::scalar_t;
   using c_scalar_t2 = typename Cdtype::scalar_t2;
@@ -105,6 +105,20 @@ __device__ void tail_write_m1_n4(float* frag_c, int4* sh_red, int4* C,
       c_sh_rd += c_sh_stride * (NumThreads / (2 * thread_n_blocks));
     }
   }
+#else
+  (void)frag_c;
+  (void)sh_red;
+  (void)C;
+  (void)sorted_token_ids_ptr;
+  (void)block_id;
+  (void)slice_col;
+  (void)prob_n;
+  (void)prob_m;
+  (void)top_k;
+  (void)moe_block_size;
+  (void)mul_topk_weights;
+  (void)topk_weights_ptr;
+#endif
 }
 
 template <const vllm::ScalarTypeId c_type_id, int thread_n_blocks, int NumThreads,
@@ -115,6 +129,7 @@ __global__ void marlin_moe_cluster_tail_kernel(
     const int32_t* __restrict__ sorted_token_ids_ptr,
     const float* __restrict__ topk_weights_ptr, int prob_m, int prob_n,
     int top_k, int moe_block_size, bool mul_topk_weights, int num_pairs) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   cooperative_groups::cluster_group cluster =
       cooperative_groups::this_cluster();
   if (cluster.num_blocks() != 2) {
@@ -122,11 +137,11 @@ __global__ void marlin_moe_cluster_tail_kernel(
   }
 
   const int pair_id = blockIdx.x / 2;
-  const int slice_idx = cluster.block_rank();
-  const bool active = pair_id < num_pairs;
-  if (!active) {
+  if (pair_id >= num_pairs) {
     return;
   }
+
+  const int slice_idx = cluster.block_rank();
 
   float frag_c[NumFloats];
   const float* src =
@@ -157,8 +172,19 @@ __global__ void marlin_moe_cluster_tail_kernel(
   tail_write_m1_n4<c_type_id, thread_n_blocks, NumThreads>(
       frag_c, sh_red, C, sorted_token_ids_ptr, block_id, slice_col, prob_n,
       prob_m, top_k, moe_block_size, mul_topk_weights, topk_weights_ptr);
+#else
+  (void)cluster_partials;
+  (void)cluster_tail_meta;
+  (void)C;
+  (void)sorted_token_ids_ptr;
+  (void)topk_weights_ptr;
+  (void)prob_m;
+  (void)prob_n;
+  (void)top_k;
+  (void)moe_block_size;
+  (void)mul_topk_weights;
+  (void)num_pairs;
+#endif
 }
 
 }  // namespace marlin_moe_tail
-
-#endif  // __CUDA_ARCH__ >= 900

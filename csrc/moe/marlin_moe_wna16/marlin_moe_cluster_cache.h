@@ -66,8 +66,10 @@ inline void ensure_non_portable_cluster_attr_cached(const void* kernel) {
   if (kernels.find(kernel) != kernels.end()) {
     return;
   }
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
   cudaFuncSetAttribute(const_cast<void*>(kernel),
                        cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+#endif
   kernels.insert(kernel);
 }
 

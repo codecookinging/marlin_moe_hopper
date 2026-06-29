@@ -343,7 +343,7 @@ inline void launch_marlin_moe_kernel(
     int num_groups, int prob_m, int prob_n, int prob_k, int* locks,
     bool has_bias, bool use_atomic_add, bool use_fp32_reduce,
     float* cluster_partials, const int* cluster_cta_pair_id,
-    const int* cluster_tail_meta, bool use_tail_cluster_reduce) {
+    int* cluster_tail_meta, bool use_tail_cluster_reduce) {
   static_assert(UseClusterReduce == true || UseClusterReduce == false,
                 "UseClusterReduce must be a compile-time boolean");
 
@@ -394,7 +394,7 @@ inline void dispatch_marlin_moe_launch(
     int num_groups, int prob_m, int prob_n, int prob_k, int* locks,
     bool has_bias, bool use_atomic_add, bool use_fp32_reduce,
     float* cluster_partials, const int* cluster_cta_pair_id,
-    const int* cluster_tail_meta, bool use_tail_cluster_reduce) {
+    int* cluster_tail_meta, bool use_tail_cluster_reduce) {
   if (plan.use_cluster) {
     launch_marlin_moe_kernel<true>(
         kernel, plan, num_threads, max_shared_mem, stream, A, B, C, C_tmp,
@@ -428,7 +428,7 @@ inline void dispatch_marlin_moe_launch_and_tail(
     int top_k, bool mul_topk_weights, int num_groups, int prob_m, int prob_n,
     int prob_k, int* locks, bool has_bias, bool use_atomic_add,
     bool use_fp32_reduce, float* cluster_partials,
-    const int* cluster_cta_pair_id, const int* cluster_tail_meta,
+    const int* cluster_cta_pair_id, int* cluster_tail_meta,
     vllm::ScalarTypeId c_type_id, int thread_m_blocks, int thread_n_blocks,
     bool m_block_size_8, bool is_a_8bit, int moe_block_size, int top_k) {
   const bool use_tail = tail_plan.use_tail_cluster && cluster_partials != nullptr;

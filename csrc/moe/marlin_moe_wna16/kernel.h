@@ -26,7 +26,7 @@
       bool use_cluster_reduce,                                         \
       float *__restrict__ cluster_partials,                            \
       const int *__restrict__ cluster_cta_pair_id,                     \
-      const int *__restrict__ cluster_tail_meta,                       \
+      int *__restrict__ cluster_tail_meta,                             \
       bool use_tail_cluster_reduce
 
 namespace MARLIN_NAMESPACE_NAME {

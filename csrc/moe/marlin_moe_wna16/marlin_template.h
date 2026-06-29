@@ -84,7 +84,7 @@ __global__ void Marlin(
     bool use_cluster_reduce,   // whether to use Hopper cluster DSMEM reduce
     float* cluster_partials,   // deferred tail partials (Phase 2)
     const int* cluster_cta_pair_id,
-    const int* cluster_tail_meta,
+    int* cluster_tail_meta,
     bool use_tail_cluster_reduce
 ) {}
 
@@ -293,7 +293,7 @@ __global__ void Marlin(
     bool use_cluster_reduce,  // whether to use Hopper cluster DSMEM reduce
     float* __restrict__ cluster_partials,
     const int* __restrict__ cluster_cta_pair_id,
-    const int* __restrict__ cluster_tail_meta,
+    int* __restrict__ cluster_tail_meta,
     bool use_tail_cluster_reduce
 ) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
