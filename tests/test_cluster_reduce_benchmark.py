@@ -4,14 +4,8 @@ Runs an isolated CUDA benchmark (not full Marlin GEMM) that compares:
   - cluster DSMEM 2-CTA reduce via marlin_hopper::cluster_streamk_reduce
   - atomic global reduce mirroring Marlin MoE Stream-K tail (lock + atomicAdd)
 
-Realistic simulation knobs (slices_per_tile, in_kernel_iters, large num_floats):
-  - slices_per_tile=2: cluster vs atomic on independent tiles
-  - slices_per_tile>2: many CTAs hammer the same output tile (Stream-K contention)
-  - in_kernel_iters=True: inner loop inside kernel (closer to Marlin, no per-iter launch)
-
 Usage:
   PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_cluster_reduce_benchmark.py -s -rs
-  PYTHONPATH=$PWD/python ./.venv/bin/pytest tests/test_cluster_reduce_benchmark.py -s -k realistic
   PYTHONPATH=$PWD/python ./.venv/bin/python tests/test_cluster_reduce_benchmark.py
 """
 
@@ -48,6 +42,7 @@ def _extension_project_root() -> str:
     ext_path = _moe_extension_path()
     if ext_path.startswith("<"):
         return "<unknown>"
+    # .../python/marlin_v100/_moe_C*.so -> repo root is three levels up
     return str(Path(ext_path).resolve().parents[2])
 
 
@@ -79,7 +74,7 @@ def _benchmark_environment() -> tuple[bool, str]:
     ext_path = _moe_extension_path()
     project_root = _extension_project_root()
     schema = _benchmark_schema_text()
-    if _benchmark_has_device_guard() and "slices_per_tile" in schema:
+    if _benchmark_has_device_guard():
         return True, ""
 
     src_ok = _bindings_source_has_device_guard()
@@ -90,7 +85,13 @@ def _benchmark_environment() -> tuple[bool, str]:
     )
     if src_ok is True:
         reason = (
-            "loaded _moe_C binary is stale; rebuild in the directory that owns the loaded .so"
+            "loaded _moe_C binary is stale even though source already contains "
+            "device_guard; rebuild in the directory that owns the loaded .so"
+        )
+    elif src_ok is False:
+        reason = (
+            "loaded project copy is stale: csrc/moe/torch_bindings_marlin.cpp "
+            "in the loaded tree still lacks device_guard (sync/copy issue)"
         )
     else:
         reason = "loaded _moe_C binary is stale relative to benchmark source"
@@ -117,32 +118,23 @@ def _require_sm90_benchmark(*, fail_instead_of_skip: bool = False) -> None:
 
 
 def _parse_result(raw: torch.Tensor) -> dict[str, float]:
-    """Decode benchmark_streamk_reduce output vector (9 floats)."""
+    """Decode benchmark_streamk_reduce output vector."""
     values = raw.detach().cpu().tolist()
     num_floats = int(values[0])
     num_threads = int(values[1])
-    atomic_ns_per_tile = float(values[2])
-    cluster_ns_per_tile = float(values[3])
+    atomic_ns_per_pair = float(values[2])
+    cluster_ns_per_pair = float(values[3])
     max_abs_diff = float(values[4])
-    num_tiles = int(values[5])
+    num_pairs = int(values[5])
     atomic_ns_per_launch = float(values[6])
-    slices_per_tile = int(values[7]) if len(values) > 7 else 2
-    in_kernel_iters = bool(values[8]) if len(values) > 8 else False
-    cluster_ns_per_launch = cluster_ns_per_tile * num_tiles
-    speedup = (
-        atomic_ns_per_tile / cluster_ns_per_tile if cluster_ns_per_tile > 0 else 0.0
-    )
+    cluster_ns_per_launch = cluster_ns_per_pair * num_pairs
+    speedup = atomic_ns_per_pair / cluster_ns_per_pair if cluster_ns_per_pair > 0 else 0.0
     return {
         "num_floats": num_floats,
         "num_threads": num_threads,
-        "num_tiles": num_tiles,
-        "num_pairs": num_tiles,
-        "slices_per_tile": slices_per_tile,
-        "in_kernel_iters": in_kernel_iters,
-        "atomic_ns_per_pair": atomic_ns_per_tile,
-        "cluster_ns_per_pair": cluster_ns_per_tile,
-        "atomic_ns_per_tile": atomic_ns_per_tile,
-        "cluster_ns_per_tile": cluster_ns_per_tile,
+        "num_pairs": num_pairs,
+        "atomic_ns_per_pair": atomic_ns_per_pair,
+        "cluster_ns_per_pair": cluster_ns_per_pair,
         "atomic_ns_per_launch": atomic_ns_per_launch,
         "cluster_ns_per_launch": cluster_ns_per_launch,
         "speedup": speedup,
@@ -154,112 +146,36 @@ def run_benchmark(
     *,
     num_floats: int = 32,
     num_threads: int = 256,
-    num_tiles: int | None = None,
-    num_pairs: int | None = None,
+    num_pairs: int = 4096,
     warmup_iters: int = 20,
     bench_iters: int = 200,
     run_verify: bool = True,
-    slices_per_tile: int = 2,
-    in_kernel_iters: bool = False,
 ) -> dict[str, float]:
-    tiles = num_tiles if num_tiles is not None else (num_pairs if num_pairs is not None else 64)
     raw = ops.benchmark_streamk_reduce(
         num_floats,
         num_threads,
-        tiles,
+        num_pairs,
         warmup_iters,
         bench_iters,
         run_verify,
-        slices_per_tile,
-        in_kernel_iters,
     )
     return _parse_result(raw)
 
 
 def _print_row(row: dict[str, float]) -> None:
-    mode = "inkernel" if row.get("in_kernel_iters") else "launch"
-    cluster_ns = row["cluster_ns_per_tile"]
-    cluster_str = f"{cluster_ns:8.1f}" if cluster_ns > 0 else "     n/a"
-    speedup = row["speedup"]
-    speedup_str = f"{speedup:5.2f}x" if cluster_ns > 0 else "   n/a"
     print(
-        f"floats={row['num_floats']:>4} thr={row['num_threads']:>3} "
-        f"tiles={row['num_tiles']:>4} slices={row['slices_per_tile']:>2} "
-        f"{mode:>7} | "
-        f"atomic {row['atomic_ns_per_tile']:8.1f} ns/tile | "
-        f"cluster {cluster_str} ns/tile | "
-        f"speedup {speedup_str} | "
+        f"num_floats={row['num_floats']:>2} "
+        f"threads={row['num_threads']:>3} "
+        f"pairs={row['num_pairs']:>5} | "
+        f"atomic {row['atomic_ns_per_pair']:8.1f} ns/pair | "
+        f"cluster {row['cluster_ns_per_pair']:8.1f} ns/pair | "
+        f"speedup {row['speedup']:5.2f}x | "
         f"max_diff {row['max_abs_diff']:.2e}"
     )
 
 
-def print_realistic_streamk_simulation() -> None:
-    """Sweep large NumFloats, in-kernel iters, and multi-CTA tile contention."""
-    num_tiles = int(os.environ.get("MARLIN_REDUCE_BENCH_TILES", "64"))
-    chunk = int(os.environ.get("MARLIN_REDUCE_BENCH_CHUNK", "8"))
-    warmup = int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "3"))
-    bench = int(os.environ.get("MARLIN_REDUCE_BENCH_ITERS", "20"))
-
-    print("\n=== Realistic Stream-K simulation ===")
-    print(f"_moe_C: {_moe_extension_path()}")
-    print(
-        f"tiles={num_tiles} chunk={chunk} warmup={warmup} bench={bench}\n"
-        "Sections:\n"
-        "  A) large NumFloats, slices=2, in-kernel (Marlin-like 2-CTA reduce)\n"
-        "  B) slices=2, in-kernel vs per-launch (launch overhead)\n"
-        "  C) multi-slice same tile (atomic contention; cluster n/a when slices>2)\n"
-    )
-    os.environ.setdefault("MARLIN_REDUCE_BENCH_CHUNK", str(chunk))
-
-    print("--- A) large NumFloats, slices=2, in_kernel ---")
-    for num_floats in (64, 128, 256, 1024):
-        print(f"  running floats={num_floats} ...", flush=True)
-        row = run_benchmark(
-            num_floats=num_floats,
-            num_threads=256,
-            num_tiles=num_tiles,
-            warmup_iters=warmup,
-            bench_iters=bench,
-            run_verify=num_floats <= 256,
-            slices_per_tile=2,
-            in_kernel_iters=True,
-        )
-        _print_row(row)
-
-    print("--- B) launch mode vs in-kernel (floats=256, slices=2) ---")
-    for in_kernel in (False, True):
-        label = "in-kernel" if in_kernel else "per-launch"
-        print(f"  running {label} ...", flush=True)
-        row = run_benchmark(
-            num_floats=256,
-            num_threads=256,
-            num_tiles=num_tiles,
-            warmup_iters=warmup,
-            bench_iters=bench,
-            run_verify=in_kernel,
-            slices_per_tile=2,
-            in_kernel_iters=in_kernel,
-        )
-        _print_row(row)
-
-    print("--- C) multi-CTA same output tile (atomic contention) ---")
-    for slices in (2, 4, 8, 16):
-        print(f"  running slices={slices} ...", flush=True)
-        row = run_benchmark(
-            num_floats=256,
-            num_threads=256,
-            num_tiles=num_tiles,
-            warmup_iters=warmup,
-            bench_iters=bench,
-            run_verify=slices == 2,
-            slices_per_tile=slices,
-            in_kernel_iters=True,
-        )
-        _print_row(row)
-    print("=" * 88)
-
-
 def _print_benchmark_env() -> tuple[int, int, int, int]:
+    """Return (num_pairs, warmup_iters, bench_iters, chunk_pairs) for print sweep."""
     return (
         int(os.environ.get("MARLIN_REDUCE_BENCH_PAIRS", "64")),
         int(os.environ.get("MARLIN_REDUCE_BENCH_WARMUP", "3")),
@@ -269,30 +185,50 @@ def _print_benchmark_env() -> tuple[int, int, int, int]:
 
 
 def print_cluster_reduce_benchmark_table() -> None:
-    num_tiles, warmup_iters, bench_iters, chunk_pairs = _print_benchmark_env()
-    print("\ncluster_streamk_reduce vs atomic global reduce (basic sweep)")
+    num_pairs, warmup_iters, bench_iters, chunk_pairs = _print_benchmark_env()
+    print("\ncluster_streamk_reduce vs atomic global reduce (isolated microbench)")
     print(f"_moe_C: {_moe_extension_path()}")
     print(f"schema: {_benchmark_schema_text()}")
     print(
-        f"sweep: tiles={num_tiles} chunk={chunk_pairs} "
-        f"warmup={warmup_iters} bench={bench_iters}"
+        f"sweep: pairs={num_pairs} chunk={chunk_pairs} "
+        f"warmup={warmup_iters} bench={bench_iters} "
+        "(MARLIN_REDUCE_BENCH_* env vars; set MARLIN_REDUCE_BENCH_CLUSTER=0 "
+        "to skip cluster path)"
     )
     print("-" * 88)
+    # Phase 1: atomic-only (set MARLIN_REDUCE_BENCH_CLUSTER=0 in rebuilt _moe_C).
+    print("  smoke atomic-only num_floats=16 threads=128 pairs=4 ...", flush=True)
+    prev_cluster = os.environ.get("MARLIN_REDUCE_BENCH_CLUSTER")
+    os.environ["MARLIN_REDUCE_BENCH_CLUSTER"] = "0"
+    os.environ.setdefault("MARLIN_REDUCE_BENCH_CHUNK", str(chunk_pairs))
+    try:
+        smoke_atomic = run_benchmark(
+            num_floats=16,
+            num_threads=128,
+            num_pairs=4,
+            warmup_iters=1,
+            bench_iters=2,
+            run_verify=False,
+        )
+        _print_row(smoke_atomic)
+    finally:
+        if prev_cluster is None:
+            os.environ.pop("MARLIN_REDUCE_BENCH_CLUSTER", None)
+        else:
+            os.environ["MARLIN_REDUCE_BENCH_CLUSTER"] = prev_cluster
 
-    print("  smoke cluster verify tiles=4 slices=2 ...", flush=True)
+    # Phase 2: cluster + atomic verify on a tiny grid.
+    print("  smoke cluster num_floats=16 threads=128 pairs=4 ...", flush=True)
     smoke = run_benchmark(
         num_floats=16,
         num_threads=128,
-        num_tiles=4,
+        num_pairs=4,
         warmup_iters=1,
         bench_iters=2,
         run_verify=True,
-        slices_per_tile=2,
-        in_kernel_iters=False,
     )
     _print_row(smoke)
     print("-" * 88)
-
     for num_floats in (16, 32, 64):
         for num_threads in (128, 256):
             print(
@@ -302,16 +238,13 @@ def print_cluster_reduce_benchmark_table() -> None:
             row = run_benchmark(
                 num_floats=num_floats,
                 num_threads=num_threads,
-                num_tiles=num_tiles,
+                num_pairs=num_pairs,
                 warmup_iters=warmup_iters,
                 bench_iters=bench_iters,
                 run_verify=False,
-                slices_per_tile=2,
-                in_kernel_iters=False,
             )
             _print_row(row)
     print("-" * 88)
-    print_realistic_streamk_simulation()
 
 
 @pytest.mark.parametrize("num_floats", [16, 32, 64])
@@ -321,116 +254,46 @@ def test_cluster_streamk_reduce_matches_atomic(num_floats: int, num_threads: int
     row = run_benchmark(
         num_floats=num_floats,
         num_threads=num_threads,
-        num_tiles=64,
+        num_pairs=64,
         warmup_iters=3,
         bench_iters=5,
         run_verify=True,
-        slices_per_tile=2,
-        in_kernel_iters=False,
     )
     assert row["max_abs_diff"] < 1e-3, (
         f"cluster vs atomic mismatch: max_abs_diff={row['max_abs_diff']}"
     )
 
 
-def test_large_num_floats_in_kernel_matches_atomic() -> None:
-    _require_sm90_benchmark()
-    for num_floats in (128, 256, 1024):
-        row = run_benchmark(
-            num_floats=num_floats,
-            num_threads=256,
-            num_tiles=32,
-            warmup_iters=2,
-            bench_iters=5,
-            run_verify=True,
-            slices_per_tile=2,
-            in_kernel_iters=True,
-        )
-        assert row["max_abs_diff"] < 1e-2, (
-            f"num_floats={num_floats} max_abs_diff={row['max_abs_diff']}"
-        )
-
-
-def test_multi_slice_atomic_contention_runs() -> None:
-    """Higher slices_per_tile stresses same-output atomic path (cluster n/a)."""
-    _require_sm90_benchmark()
-    for slices in (4, 8, 16):
-        row = run_benchmark(
-            num_floats=256,
-            num_threads=256,
-            num_tiles=32,
-            warmup_iters=2,
-            bench_iters=5,
-            run_verify=False,
-            slices_per_tile=slices,
-            in_kernel_iters=True,
-        )
-        assert row["cluster_ns_per_tile"] == 0.0
-        assert row["atomic_ns_per_tile"] > 0.0
-
-
-def test_in_kernel_cluster_can_beat_launch_mode() -> None:
-    """Soft check: in-kernel cluster should not lose badly to in-kernel atomic."""
-    if os.environ.get("MARLIN_SKIP_REDUCE_PERF_ASSERT") == "1":
-        pytest.skip("performance assertion disabled")
-
-    _require_sm90_benchmark()
-    common = dict(
-        num_floats=256,
-        num_threads=256,
-        num_tiles=64,
-        warmup_iters=5,
-        bench_iters=30,
-        run_verify=True,
-        slices_per_tile=2,
-    )
-    launch_row = run_benchmark(**common, in_kernel_iters=False)
-    inkernel_row = run_benchmark(**common, in_kernel_iters=True)
-    _print_row(launch_row)
-    _print_row(inkernel_row)
-    # In-kernel should improve both; cluster may exceed atomic on large tiles.
-    assert inkernel_row["speedup"] >= launch_row["speedup"] * 0.8, (
-        f"in-kernel speedup regressed: launch={launch_row['speedup']:.2f}x "
-        f"inkernel={inkernel_row['speedup']:.2f}x"
-    )
-
-
 def test_cluster_streamk_reduce_faster_than_atomic() -> None:
+    """Soft performance check; skip when explicitly disabled."""
     if os.environ.get("MARLIN_SKIP_REDUCE_PERF_ASSERT") == "1":
         pytest.skip("performance assertion disabled")
 
     _require_sm90_benchmark()
     row = run_benchmark(
-        num_floats=256,
+        num_floats=32,
         num_threads=256,
-        num_tiles=64,
-        warmup_iters=5,
-        bench_iters=30,
+        num_pairs=1024,
+        warmup_iters=10,
+        bench_iters=100,
         run_verify=True,
-        slices_per_tile=2,
-        in_kernel_iters=True,
     )
     _print_row(row)
-    assert row["speedup"] > 1.0, (
-        "expected in-kernel cluster DSMEM reduce to beat atomic on large tiles "
+    assert row["speedup"] > 1.2, (
+        "expected cluster DSMEM reduce to beat atomic global reduce "
         f"(speedup={row['speedup']:.2f}x)"
     )
 
 
 def test_print_cluster_reduce_benchmark_table() -> None:
+    """Print a small sweep table (use pytest -s to see stdout)."""
     print("\n[cluster reduce benchmark] starting...", flush=True)
     _require_sm90_benchmark(fail_instead_of_skip=True)
     print_cluster_reduce_benchmark_table()
-
-
-def test_print_realistic_streamk_simulation() -> None:
-    print("\n[realistic stream-k simulation] starting...", flush=True)
-    _require_sm90_benchmark(fail_instead_of_skip=True)
-    print_realistic_streamk_simulation()
 
 
 if __name__ == "__main__":
     ok, message = _benchmark_environment()
     if not ok:
         raise SystemExit(message)
-    print_realistic_streamk_simulation()
+    print_cluster_reduce_benchmark_table()
