@@ -164,7 +164,7 @@ def run_benchmark(
 
 def _print_row(row: dict[str, float]) -> None:
     print(
-        f"num_floats={row['num_floats']:>2} "
+        f"num_floats={row['num_floats']:>3} "
         f"threads={row['num_threads']:>3} "
         f"pairs={row['num_pairs']:>5} | "
         f"atomic {row['atomic_ns_per_pair']:8.1f} ns/pair | "
@@ -229,7 +229,7 @@ def print_cluster_reduce_benchmark_table() -> None:
     )
     _print_row(smoke)
     print("-" * 88)
-    for num_floats in (16, 32, 64):
+    for num_floats in (16, 32, 64, 512):
         for num_threads in (128, 256):
             print(
                 f"  running num_floats={num_floats} threads={num_threads} ...",

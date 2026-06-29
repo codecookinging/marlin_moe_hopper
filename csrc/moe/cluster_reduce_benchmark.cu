@@ -372,8 +372,12 @@ at::Tensor dispatch_floats(int num_floats, int num_threads, int num_pairs,
     return dispatch_threads<64>(num_threads, num_pairs, warmup_iters,
                                 bench_iters, run_verify, device);
   }
+  if (num_floats == 512) {
+    return dispatch_threads<512>(num_threads, num_pairs, warmup_iters,
+                               bench_iters, run_verify, device);
+  }
   TORCH_CHECK(false, "Unsupported num_floats=", num_floats,
-              " (supported: 16, 32, 64)");
+              " (supported: 16, 32, 64, 512)");
 }
 
 int device_major_capability(at::Device device) {
