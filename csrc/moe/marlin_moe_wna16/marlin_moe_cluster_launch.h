@@ -154,6 +154,60 @@ inline bool allow_whole_kernel_cluster_launch() {
   return env_flag_enabled("MARLIN_MOE_WHOLE_KERNEL_CLUSTER");
 }
 
+inline bool tail_cluster_reduce_enabled() {
+  return !env_flag_enabled("MARLIN_MOE_DISABLE_CLUSTER_REDUCE") &&
+         !env_flag_enabled("MARLIN_MOE_DISABLE_TAIL_CLUSTER_REDUCE");
+}
+
+// Tail kernel is only instantiated for a narrow tile shape. Skip all tail host
+// planning when the selected exec config cannot dispatch it.
+inline bool tail_kernel_dispatch_supported(
+    vllm::ScalarTypeId c_type_id, int thread_m_blocks, bool m_block_size_8,
+    bool is_a_8bit, int num_threads, int thread_n_blocks) {
+  if (thread_m_blocks != 1 || m_block_size_8 || is_a_8bit) {
+    return false;
+  }
+  if (c_type_id != vllm::kBFloat16.id() && c_type_id != vllm::kFloat16.id()) {
+    return false;
+  }
+  if (num_threads == 256 &&
+      (thread_n_blocks == 8 || thread_n_blocks == 4)) {
+    return true;
+  }
+  // small_batch_thread_configs: {64, 256, 128} -> n_blocks=16, 128 threads
+  if (num_threads == 128 && thread_n_blocks == 16) {
+    return true;
+  }
+  return false;
+}
+
+// Avoid cluster/tail host planning (and any cluster CUDA driver queries)
+// unless a cluster feature can actually activate for this launch.
+inline bool needs_cluster_host_plan(
+    int major_capability, int parallel_padded, int prob_k, int prob_n,
+    int thread_k_blocks, int thread_n_blocks, int logical_blocks,
+    vllm::ScalarTypeId c_type_id, int thread_m_blocks, bool m_block_size_8,
+    bool is_a_8bit, int num_threads) {
+  if (major_capability < 9) {
+    return false;
+  }
+  if (env_flag_enabled("MARLIN_MOE_DISABLE_CLUSTER_REDUCE")) {
+    return false;
+  }
+  if (!needs_part2_streamk_tail(parallel_padded, prob_k, prob_n,
+                                thread_k_blocks, thread_n_blocks,
+                                logical_blocks)) {
+    return false;
+  }
+  if (allow_whole_kernel_cluster_launch()) {
+    return true;
+  }
+  return tail_cluster_reduce_enabled() &&
+         tail_kernel_dispatch_supported(c_type_id, thread_m_blocks,
+                                        m_block_size_8, is_a_8bit, num_threads,
+                                        thread_n_blocks);
+}
+
 // Minimum fraction of Part2-active CTAs that hit slice_count==2 before we even
 // consider whole-kernel cluster launch (still gated by allow_* above).
 constexpr float kMinSliceEq2Fraction = 0.80f;
@@ -187,14 +241,15 @@ inline TailClusterPlan compute_tail_cluster_plan(
     int thread_m_blocks, bool m_block_size_8, bool is_a_8bit,
     vllm::ScalarTypeId c_type_id, int num_threads) {
   TailClusterPlan plan{};
-  if (env_flag_enabled("MARLIN_MOE_DISABLE_CLUSTER_REDUCE") ||
-      env_flag_enabled("MARLIN_MOE_DISABLE_TAIL_CLUSTER_REDUCE")) {
+  if (!tail_cluster_reduce_enabled()) {
     return plan;
   }
   if (major_capability < 9) {
     return plan;
   }
-  if (thread_m_blocks != 1 || m_block_size_8 || is_a_8bit) {
+  if (!tail_kernel_dispatch_supported(c_type_id, thread_m_blocks,
+                                      m_block_size_8, is_a_8bit, num_threads,
+                                      thread_n_blocks)) {
     return plan;
   }
   if (!needs_part2_streamk_tail(parallel_padded, prob_k, prob_n,
@@ -237,16 +292,6 @@ inline TailClusterPlan compute_tail_cluster_plan(
   }
 
   if (plan.num_pairs <= 0) {
-    return plan;
-  }
-
-  const bool tail_dispatch_ok =
-      (c_type_id == vllm::kBFloat16.id() || c_type_id == vllm::kFloat16.id()) &&
-      plan.num_floats == 32 && num_threads == 256 &&
-      (thread_n_blocks == 8 || thread_n_blocks == 4);
-  if (!tail_dispatch_ok) {
-    plan.num_pairs = 0;
-    plan.cta_pair_id.assign(logical_blocks, -1);
     return plan;
   }
 

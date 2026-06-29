@@ -73,4 +73,21 @@ inline void ensure_non_portable_cluster_attr_cached(const void* kernel) {
   kernels.insert(kernel);
 }
 
+inline void ensure_max_dynamic_smem_cached(const void* kernel, int smem_bytes) {
+  if (kernel == nullptr) {
+    return;
+  }
+  static std::vector<ClusterOccCacheEntry> entries;
+  for (const auto& entry : entries) {
+    if (entry.valid && entry.kernel == kernel &&
+        entry.max_shared_mem == smem_bytes) {
+      return;
+    }
+  }
+  cudaFuncSetAttribute(const_cast<void*>(kernel),
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
+  entries.push_back(
+      ClusterOccCacheEntry{kernel, 0, smem_bytes, 0, true});
+}
+
 }  // namespace marlin_moe_host

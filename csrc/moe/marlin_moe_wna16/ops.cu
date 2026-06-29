@@ -29,6 +29,7 @@
 
 #include "kernel.h"
 #include "marlin_moe_cluster_launch.h"
+#include "marlin_moe_cluster_cache.h"
 #include "core/registration.h"
 
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
@@ -549,24 +550,39 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                 ", num_bits = ", num_bits);
   }
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+  marlin_moe_host::ensure_max_dynamic_smem_cached(
+      reinterpret_cast<const void*>(kernel), max_shared_mem);
 
   int parallel_padded = num_tokens_past_padded_count / moe_block_size;
-  marlin_moe_host::ClusterLaunchPlan cluster_plan =
-      marlin_moe_host::compute_cluster_launch_plan(
+  marlin_moe_host::ClusterLaunchPlan cluster_plan{};
+  cluster_plan.launch_blocks = blocks;
+  cluster_plan.logical_blocks = logical_blocks;
+  cluster_plan.use_atomic_add = use_atomic_add;
+  cluster_plan.use_fp32_reduce = use_fp32_reduce;
+
+  marlin_moe_host::TailClusterPlan tail_plan{};
+  if (marlin_moe_host::needs_cluster_host_plan(
+          major_capability, parallel_padded, prob_k, prob_n, thread_k_blocks,
+          thread_n_blocks, logical_blocks, c_type.id(), thread_m_blocks,
+          m_block_size_8, is_a_8bit, num_threads)) {
+    if (marlin_moe_host::allow_whole_kernel_cluster_launch()) {
+      cluster_plan = marlin_moe_host::compute_cluster_launch_plan(
           major_capability, parallel_padded, prob_k, prob_n, thread_k_blocks,
           thread_n_blocks, logical_blocks, blocks, use_atomic_add,
           use_fp32_reduce, kernel, num_threads, max_shared_mem);
-  use_atomic_add = cluster_plan.use_atomic_add;
-  use_fp32_reduce = cluster_plan.use_fp32_reduce;
-  blocks = cluster_plan.launch_blocks;
-
-  marlin_moe_host::TailClusterPlan tail_plan =
-      marlin_moe_host::compute_tail_cluster_plan(
+      use_atomic_add = cluster_plan.use_atomic_add;
+      use_fp32_reduce = cluster_plan.use_fp32_reduce;
+      blocks = cluster_plan.launch_blocks;
+    }
+    if (marlin_moe_host::tail_kernel_dispatch_supported(
+            c_type.id(), thread_m_blocks, m_block_size_8, is_a_8bit,
+            num_threads, thread_n_blocks)) {
+      tail_plan = marlin_moe_host::compute_tail_cluster_plan(
           major_capability, parallel_padded, prob_k, prob_n, thread_k_blocks,
           thread_n_blocks, logical_blocks, thread_m_blocks, m_block_size_8,
           is_a_8bit, c_type.id(), num_threads);
+    }
+  }
 
   float* cluster_partials_ptr = nullptr;
   int* cluster_cta_pair_id_ptr = nullptr;

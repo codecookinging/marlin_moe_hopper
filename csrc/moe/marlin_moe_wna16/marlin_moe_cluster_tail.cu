@@ -43,9 +43,8 @@ void launch_tail_kernel(float* partials, const int* tail_meta, int4* C,
   if (cluster_size < 2) {
     return;
   }
-  cudaFuncSetAttribute(const_cast<void*>(kernel_ptr),
-                       cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-  ensure_non_portable_cluster_attr_cached(kernel_ptr);
+  marlin_moe_host::ensure_max_dynamic_smem_cached(kernel_ptr, smem);
+  marlin_moe_host::ensure_non_portable_cluster_attr_cached(kernel_ptr);
   const int blocks = num_pairs * cluster_size;
   cudaLaunchConfig_t config{};
   config.gridDim = blocks;
@@ -115,6 +114,20 @@ void dispatch_marlin_moe_cluster_tail(
   if (c_type_id == vllm::kFloat16.id() && thread_n_blocks == 4 &&
       num_threads == 256 && num_floats == 32) {
     launch_tail_kernel<vllm::kFloat16.id(), 4, 256, 32>(
+        partials, tail_meta, C, sorted_token_ids, topk_weights, prob_m, prob_n,
+        top_k, moe_block_size, mul_topk_weights, num_pairs, stream);
+    return;
+  }
+  if (c_type_id == vllm::kBFloat16.id() && thread_n_blocks == 16 &&
+      num_threads == 128 && num_floats == 32) {
+    launch_tail_kernel<vllm::kBFloat16.id(), 16, 128, 32>(
+        partials, tail_meta, C, sorted_token_ids, topk_weights, prob_m, prob_n,
+        top_k, moe_block_size, mul_topk_weights, num_pairs, stream);
+    return;
+  }
+  if (c_type_id == vllm::kFloat16.id() && thread_n_blocks == 16 &&
+      num_threads == 128 && num_floats == 32) {
+    launch_tail_kernel<vllm::kFloat16.id(), 16, 128, 32>(
         partials, tail_meta, C, sorted_token_ids, topk_weights, prob_m, prob_n,
         top_k, moe_block_size, mul_topk_weights, num_pairs, stream);
   }
