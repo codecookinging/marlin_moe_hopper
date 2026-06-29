@@ -52,8 +52,10 @@ std::tuple<torch::Tensor, torch::Tensor> grouped_topk(
 
 torch::Tensor benchmark_streamk_reduce(const torch::Tensor& device_guard,
                                        int64_t num_floats, int64_t num_threads,
-                                       int64_t num_pairs, int64_t warmup_iters,
-                                       int64_t bench_iters, bool run_verify);
+                                       int64_t num_tiles, int64_t warmup_iters,
+                                       int64_t bench_iters, bool run_verify,
+                                       int64_t slices_per_tile,
+                                       bool in_kernel_iters);
 #endif
 
 bool moe_permute_unpermute_supported();

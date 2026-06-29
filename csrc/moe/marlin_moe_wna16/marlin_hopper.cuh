@@ -93,13 +93,13 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
   if (slice_idx == 1) {
     float4* pack4 = reinterpret_cast<float4*>(pack);
     float4* frag4 = reinterpret_cast<float4*>(frag_c);
-    if (threadIdx.x < Vecs) {
-      pack4[threadIdx.x] = frag4[threadIdx.x];
+    for (int v = threadIdx.x; v < Vecs; v += blockDim.x) {
+      pack4[v] = frag4[v];
     }
     if constexpr (Tail > 0) {
-      if (threadIdx.x < Tail) {
+      for (int t = threadIdx.x; t < Tail; t += blockDim.x) {
         constexpr int TailBase = Vecs * 4;
-        pack[TailBase + threadIdx.x] = frag_c[TailBase + threadIdx.x];
+        pack[TailBase + t] = frag_c[TailBase + t];
       }
     }
   }
@@ -109,19 +109,19 @@ __device__ __forceinline__ ClusterReduceStatus cluster_streamk_reduce(
     float* peer_pack = cluster.map_shared_rank(pack, 1 - rank);
     float4* peer4 = reinterpret_cast<float4*>(peer_pack);
     float4* frag4 = reinterpret_cast<float4*>(frag_c);
-    if (threadIdx.x < Vecs) {
-      float4 a = frag4[threadIdx.x];
-      float4 b = peer4[threadIdx.x];
+    for (int v = threadIdx.x; v < Vecs; v += blockDim.x) {
+      float4 a = frag4[v];
+      float4 b = peer4[v];
       a.x += b.x;
       a.y += b.y;
       a.z += b.z;
       a.w += b.w;
-      frag4[threadIdx.x] = a;
+      frag4[v] = a;
     }
     if constexpr (Tail > 0) {
-      if (threadIdx.x < Tail) {
+      for (int t = threadIdx.x; t < Tail; t += blockDim.x) {
         constexpr int TailBase = Vecs * 4;
-        frag_c[TailBase + threadIdx.x] += peer_pack[TailBase + threadIdx.x];
+        frag_c[TailBase + t] += peer_pack[TailBase + t];
       }
     }
   }
