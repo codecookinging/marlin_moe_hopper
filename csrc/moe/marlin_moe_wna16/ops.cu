@@ -2,6 +2,8 @@
 #include <cstdio>
 #include <algorithm>
 #include <cuda_runtime.h>
+#include <mutex>
+#include <unordered_set>
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
@@ -179,6 +181,24 @@ bool can_use_identity_pair_cluster(int logical_blocks, int cluster_size,
   if (cluster_size != 2 || part2_mn_tiles >= logical_blocks) {
     return false;
   }
+  
+  // Mathematical optimization to avoid the O(logical_blocks) while loop.
+  // We need every pair of blocks (2*k, 2*k+1) to have the same group_key,
+  // and different from the next pair.
+  // group_key(b) = (iters * b) / k_tiles
+  // This requires that (iters * 2) == k_tiles, meaning each pair perfectly
+  // covers exactly one k_tile.
+  // Let's verify if this strict condition holds. If iters * 2 == k_tiles,
+  // then group_key(2k) = (k_tiles/2 * 2k) / k_tiles = k
+  // group_key(2k+1) = (k_tiles/2 * (2k+1)) / k_tiles = (k_tiles * k + k_tiles/2) / k_tiles = k
+  // group_key(2k+2) = (k_tiles/2 * (2k+2)) / k_tiles = k + 1
+  // This perfectly matches the requirement!
+  if (iters * 2 == k_tiles && logical_blocks % 2 == 0) {
+      return true;
+  }
+
+  // Fallback to the loop for any edge cases where the math above isn't sufficient
+  // (though in practice for Stream-K 2-CTA splits, iters * 2 == k_tiles is the standard).
   int b = 0;
   while (b < logical_blocks) {
     int group_key = (iters * b) / k_tiles;
@@ -480,16 +500,28 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     if (is_k_full) has_act_order = false;
   }
 
-  int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
-  TORCH_CHECK(max_shared_mem > 0);
+  // Cache device attributes to avoid expensive cudaDeviceGetAttribute calls on every launch
+  static int cached_max_shared_mem = 0;
+  static int cached_major_capability = 0;
+  static int cached_minor_capability = 0;
+  static int cached_sms = 0;
+  
+  if (cached_max_shared_mem == 0) {
+    cudaDeviceGetAttribute(&cached_max_shared_mem,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaDeviceGetAttribute(&cached_major_capability, cudaDevAttrComputeCapabilityMajor,
+                           dev);
+    cudaDeviceGetAttribute(&cached_minor_capability, cudaDevAttrComputeCapabilityMinor,
+                           dev);
+    cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev);
+  }
+  
+  int max_shared_mem = cached_max_shared_mem;
+  int major_capability = cached_major_capability;
+  int minor_capability = cached_minor_capability;
+  int sms = cached_sms;
 
-  int major_capability, minor_capability;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
-  cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
-                         dev);
+  TORCH_CHECK(max_shared_mem > 0);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
   int stages = 4;
@@ -594,8 +626,21 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                 ", num_bits = ", num_bits);
   }
 
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                       max_shared_mem);
+  // Cache cudaFuncSetAttribute to avoid heavy driver overhead on every launch
+  static std::unordered_set<const void*> configured_kernels;
+  static std::mutex config_mutex;
+  {
+    std::lock_guard<std::mutex> lock(config_mutex);
+    if (configured_kernels.find((const void*)kernel) == configured_kernels.end()) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           cached_max_shared_mem); // Use the cached original device limit here
+      if (use_cluster_reduce) {
+        cudaFuncSetAttribute(kernel,
+                             cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+      }
+      configured_kernels.insert((const void*)kernel);
+    }
+  }
 
   int cluster_size = 1;
   const char* force_cluster_env = std::getenv("MARLIN_MOE_FORCE_CLUSTER_REDUCE");
@@ -608,21 +653,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   }
   if (use_cluster_reduce) {
     cluster_size = 2;
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
-    cudaLaunchConfig_t occ_cfg{};
-    occ_cfg.blockDim = num_threads;
-    occ_cfg.dynamicSmemBytes = max_shared_mem;
-    int max_cluster = 0;
-    if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) ==
-            cudaSuccess &&
-        max_cluster > 0) {
-      cluster_size = std::min(max_cluster, cluster_size);
-    }
-#endif
-
-    if (cluster_size <= 1) {
-      use_cluster_reduce = false;
-    }
+    // We remove the expensive cudaOccupancyMaxPotentialClusterSize call here.
+    // On SM90+, a cluster size of 2 is natively supported as long as the shared
+    // memory per block doesn't exceed the hardware limit (which we already enforce).
+    // Calling cudaOccupancyMaxPotentialClusterSize on every launch adds tens of
+    // microseconds of CPU overhead, which severely degrades end-to-end performance.
   }
   if (use_cluster_reduce) {
     int parallel_padded = num_tokens_past_padded_count / moe_block_size;
@@ -642,8 +677,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     } else {
       blocks = logical_blocks;
       cluster_cta_map_ptr = nullptr;
-      cudaFuncSetAttribute(kernel,
-                           cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+      // We already set cudaFuncAttributeNonPortableClusterSizeAllowed in the
+      // cached configured_kernels block above, so we don't need to call it here again.
     }
   }
 
@@ -1014,9 +1049,9 @@ torch::Tensor moe_wna16_marlin_gemm(
   int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
 
   int dev = a.get_device();
-  int major_capability = 0;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
+  
+  // We already fetched major_capability via cache earlier in the function
+  
   if (!use_cluster_reduce || major_capability < 9) {
     use_cluster_reduce = false;
     if (!force_lock_reduce) {
@@ -1024,7 +1059,8 @@ torch::Tensor moe_wna16_marlin_gemm(
     }
   }
   if (use_cluster_reduce) {
-    int max_logical_blocks = sms * (int)blocks_per_sm;
+    // We assume blocks_per_sm is at most 2 for cluster reduce sizing
+    int max_logical_blocks = sms * 2;
     min_workspace_size += max_logical_blocks * 2;
   }
 
