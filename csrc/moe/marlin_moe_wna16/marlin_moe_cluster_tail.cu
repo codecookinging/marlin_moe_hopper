@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include "core/scalar_type.hpp"
+#include "marlin_moe_cluster_cache.h"
 
 namespace marlin_moe_host {
 
@@ -27,11 +28,19 @@ void launch_tail_kernel(float* partials, const int* tail_meta, int4* C,
   auto* kernel =
       marlin_moe_tail::marlin_moe_cluster_tail_kernel<c_type_id, thread_n_blocks,
                                                     num_threads, num_floats>;
-  cudaFuncSetAttribute(
-      kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-  const int cluster_size = 2;
-  const int blocks = num_pairs * cluster_size;
+  const void* kernel_ptr = reinterpret_cast<const void*>(kernel);
   const int smem = tail_smem_bytes(thread_n_blocks, num_floats);
+  const int max_cluster =
+      query_max_cluster_size_cached(kernel_ptr, num_threads, smem);
+  int cluster_size = 2;
+  if (max_cluster > 0) {
+    cluster_size = std::min(max_cluster, cluster_size);
+  }
+  if (cluster_size < 2) {
+    return;
+  }
+  ensure_non_portable_cluster_attr_cached(kernel_ptr);
+  const int blocks = num_pairs * cluster_size;
   cudaLaunchConfig_t config{};
   config.gridDim = blocks;
   config.blockDim = num_threads;

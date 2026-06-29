@@ -9,6 +9,7 @@
 #include <cuda_runtime.h>
 
 #include "kernel.h"
+#include "marlin_moe_cluster_cache.h"
 #include "marlin_moe_cluster_tail.h"
 #include "core/scalar_type.hpp"
 
@@ -141,8 +142,6 @@ struct ClusterLaunchPlan {
   bool use_fp32_reduce = false;
 };
 
-using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
-
 inline bool env_flag_enabled(const char* name) {
   const char* value = std::getenv(name);
   return value != nullptr && value[0] == '1';
@@ -170,54 +169,16 @@ inline bool cluster_roi_allows_whole_kernel_launch(
   return eq2_frac >= kMinSliceEq2Fraction && stats.slice_gt_2 == 0;
 }
 
-struct ClusterLaunchCache {
-  MarlinFuncPtr kernel = nullptr;
-  int num_threads = 0;
-  int max_shared_mem = 0;
-  int max_cluster = 0;
-  bool non_portable_attr_set = false;
-};
-
-inline ClusterLaunchCache& cluster_launch_cache() {
-  static ClusterLaunchCache cache{};
-  return cache;
-}
+using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
 
 inline int query_max_cluster_size(MarlinFuncPtr kernel, int num_threads,
                                   int max_shared_mem) {
-  auto& cache = cluster_launch_cache();
-  if (cache.kernel == kernel && cache.num_threads == num_threads &&
-      cache.max_shared_mem == max_shared_mem && cache.max_cluster > 0) {
-    return cache.max_cluster;
-  }
-
-  int max_cluster = 0;
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12000
-  cudaLaunchConfig_t occ_cfg{};
-  occ_cfg.blockDim = num_threads;
-  occ_cfg.dynamicSmemBytes = max_shared_mem;
-  if (cudaOccupancyMaxPotentialClusterSize(&max_cluster, kernel, &occ_cfg) !=
-      cudaSuccess) {
-    max_cluster = 0;
-  }
-#endif
-
-  cache.kernel = kernel;
-  cache.num_threads = num_threads;
-  cache.max_shared_mem = max_shared_mem;
-  cache.max_cluster = max_cluster;
-  return max_cluster;
+  return query_max_cluster_size_cached(reinterpret_cast<const void*>(kernel),
+                                       num_threads, max_shared_mem);
 }
 
 inline void ensure_non_portable_cluster_attr(MarlinFuncPtr kernel) {
-  auto& cache = cluster_launch_cache();
-  if (cache.non_portable_attr_set && cache.kernel == kernel) {
-    return;
-  }
-  cudaFuncSetAttribute(kernel,
-                       cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-  cache.kernel = kernel;
-  cache.non_portable_attr_set = true;
+  ensure_non_portable_cluster_attr_cached(reinterpret_cast<const void*>(kernel));
 }
 
 inline TailClusterPlan compute_tail_cluster_plan(
