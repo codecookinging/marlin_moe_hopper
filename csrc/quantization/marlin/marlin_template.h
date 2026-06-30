@@ -263,6 +263,8 @@ __global__ void Marlin(MARLIN_KERNEL_PARAMS) {
   #endif
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
+  const int4* A0 = A;
+  int4* C0 = C;
 
   using scalar_t = typename MarlinScalarType<a_type_id>::scalar_t;
   using scalar_t2 = typename MarlinScalarType<a_type_id>::scalar_t2;
