@@ -38,9 +38,10 @@ namespace MARLIN_NAMESPACE_NAME {
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
 
-template <typename scalar_t,  // compute dtype, half or nv_float16
-          const vllm::ScalarTypeId b_type_id,  // weight MarlinScalarType id
-          const vllm::ScalarTypeId s_type_id,  // weight scale ScalarType id
+template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
+          const vllm::ScalarTypeId b_type_id,  // B ScalarType id
+          const vllm::ScalarTypeId c_type_id,  // C ScalarType id
+          const vllm::ScalarTypeId s_type_id,  // B_SCALE ScalarType id
           const int threads,          // number of threads in a threadblock
           const int thread_m_blocks,  // number of 16x16 blocks in the m
                                       // dimension (batchsize) of the
@@ -51,26 +52,11 @@ template <typename scalar_t,  // compute dtype, half or nv_float16
                                       // only works when thread_m_blocks == 1
           const int stages,  // number of stages for the async global->shared
                              // fetch pipeline
-          const bool has_act_order,  // whether act_order is enabled
-          const int group_blocks,    // number of consecutive 16x16 blocks
-                                     // with a separate quantization scale
-          const bool is_zp_float     // is zero point of float16 type?
+          const int group_blocks,  // number of consecutive 16x16 blocks
+                                   // with a separate quantization scale
+          const bool is_zp_float   // is zero point of float16 type?
           >
-__global__ void Marlin(
-    const int4* __restrict__ A,  // fp16 input matrix of shape mxk
-    const int4* __restrict__ B,  // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C,        // fp16 output buffer of shape mxn
-    int4* __restrict__ C_tmp,    // fp32 tmp output buffer (for reduce)
-    const int4* __restrict__ scales_ptr,  // fp16 quantization scales of shape
-                                          // (k/groupsize)xn
-    const int* __restrict__ g_idx,        // int32 group indices of shape k
-    int num_groups,       // number of scale groups per output channel
-    int prob_m,           // batch dimension m
-    int prob_n,           // output dimension n
-    int prob_k,           // reduction dimension k
-    int* locks,           // extra global storage for barrier synchronization
-    bool use_fp32_reduce  // whether to use fp32 global reduce
-) {}
+__global__ void Marlin(MARLIN_KERNEL_PARAMS) {}
 
 }  // namespace marlin
 
@@ -240,34 +226,7 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                                    // with a separate quantization scale
           const bool is_zp_float   // is zero point of float16 type?
           >
-__global__ void Marlin(
-    const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
-    const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
-    int4* __restrict__ C0,        // fp16 output buffer of shape mxn
-    int4* __restrict__ C_tmp,     // fp32 tmp output buffer (for reduce)
-    const int4* __restrict__ b_bias_ptr,
-    // float scales of input matrix, only used when is_a_8bit == true.
-    // shape (m,)
-    const float* __restrict__ a_scales_ptr,
-    // fp16 quantization scales. shape (k/groupsize, n)
-    const int4* __restrict__ scales_ptr,
-    // float global scale (for nvfp4// only)
-    const float* __restrict__ global_scale_ptr,
-    // 4bit packed zero-points of shape
-    // (k/groupsize, n/pack_factor)
-    const int4* __restrict__ zp_ptr,
-    // int32 group indices of shape k
-    const int* __restrict__ g_idx,
-    int num_groups,  // number of scale groups per output channel
-    int prob_m,      // batch dimension m
-    int prob_n,      // output dimension n
-    int prob_k,      // reduction dimension k
-    int lda,         // A.stride(0), equal to prob_k is A is contiguous
-    int* locks,      // extra global storage for barrier synchronization
-    bool has_bias,
-    bool use_atomic_add,   // whether to use atomic add to reduce
-    bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+__global__ void Marlin(MARLIN_KERNEL_PARAMS) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -304,8 +263,6 @@ __global__ void Marlin(
   #endif
   using Adtype = MarlinScalarType<a_type_id>;
   using Cdtype = MarlinScalarType<c_type_id>;
-  const int4* A = A0;
-  int4* C = C0;
 
   using scalar_t = typename MarlinScalarType<a_type_id>::scalar_t;
   using scalar_t2 = typename MarlinScalarType<a_type_id>::scalar_t2;
