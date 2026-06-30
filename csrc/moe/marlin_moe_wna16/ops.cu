@@ -326,7 +326,7 @@ MarlinFuncPtr get_marlin_kernel(
     const vllm::ScalarType c_type, const vllm::ScalarType s_type,
     int thread_m_blocks, int thread_n_blocks, int thread_k_blocks,
     bool m_block_size_8, bool has_act_order, bool has_zp, int group_blocks,
-    int threads, bool is_zp_float, int stages) {
+    int threads, bool is_zp_float, int stages, int cluster_size) {
   int num_bits = b_type.size_bits();
   auto kernel = MarlinDefault;
 
@@ -377,7 +377,7 @@ exec_config_t determine_exec_config(
         get_marlin_kernel(a_type, b_type, c_type, s_type, thread_m_blocks,
                           th_config.thread_n / 16, th_config.thread_k / 16,
                           m_block_size_8, has_act_order, has_zp, group_blocks,
-                          th_config.num_threads, is_zp_float, stages);
+                          th_config.num_threads, is_zp_float, stages, 1);
 
     if (kernel == MarlinDefault) continue;
 
@@ -504,6 +504,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   static int cached_max_shared_mem = 0;
   static int cached_major_capability = 0;
   static int cached_minor_capability = 0;
+  static int cached_sms = 0;
   
   if (cached_max_shared_mem == 0) {
     cudaDeviceGetAttribute(&cached_max_shared_mem,
@@ -512,6 +513,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                            dev);
     cudaDeviceGetAttribute(&cached_minor_capability, cudaDevAttrComputeCapabilityMinor,
                            dev);
+    cudaDeviceGetAttribute(&cached_sms, cudaDevAttrMultiProcessorCount, dev);
   }
   
   int max_shared_mem = cached_max_shared_mem;
@@ -544,6 +546,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   // Set thread config
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
+  
   if (thread_k != -1 && thread_n != -1) {
     thread_tfg = thread_config_t{thread_k, thread_n, thread_k * thread_n / 64};
     if (blocks_per_sm == -1) blocks_per_sm = 1;
@@ -555,20 +558,58 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   } else {
     // Auto config
     bool is_sm90 = major_capability >= 9;
-    exec_cfg = determine_exec_config(
-        a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
-        top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
-        has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
-        max_shared_mem, sms, is_sm90);
-    // On SM90+ we prefer stages=5 but fall back to stages=4 when the chosen
-    // tile configuration does not fit in shared memory at depth 5.
-    if (is_sm90 && stages == 5 && exec_cfg.tb_cfg.thread_k == -1) {
-      stages = 4;
+    
+    // Fast path for auto config cache
+    // We can hash the input parameters to avoid calling determine_exec_config which contains loops
+    struct ConfigKey {
+      vllm::ScalarType a_type, b_type, c_type, s_type;
+      int prob_m, prob_n, prob_k, num_experts, top_k, thread_m_blocks;
+      bool m_block_size_8; int num_bits, group_size; bool has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit;
+      int stages, max_shared_mem, sms; bool is_sm90;
+      
+      bool operator==(const ConfigKey& other) const {
+        return a_type == other.a_type && b_type == other.b_type && c_type == other.c_type && s_type == other.s_type &&
+               prob_m == other.prob_m && prob_n == other.prob_n && prob_k == other.prob_k && num_experts == other.num_experts &&
+               top_k == other.top_k && thread_m_blocks == other.thread_m_blocks && m_block_size_8 == other.m_block_size_8 &&
+               num_bits == other.num_bits && group_size == other.group_size && has_act_order == other.has_act_order &&
+               is_k_full == other.is_k_full && has_zp == other.has_zp && is_zp_float == other.is_zp_float &&
+               is_a_8bit == other.is_a_8bit && stages == other.stages && max_shared_mem == other.max_shared_mem &&
+               sms == other.sms && is_sm90 == other.is_sm90;
+      }
+    };
+    
+    struct ConfigKeyHash {
+      std::size_t operator()(const ConfigKey& k) const {
+        // Simple hash combining some key fields
+        return std::hash<int>()(k.prob_m) ^ (std::hash<int>()(k.prob_n) << 1) ^ (std::hash<int>()(k.prob_k) << 2) ^
+               (std::hash<int>()(k.stages) << 3) ^ (std::hash<int>()(k.num_bits) << 4);
+      }
+    };
+    
+    static thread_local std::unordered_map<ConfigKey, exec_config_t, ConfigKeyHash> exec_cfg_cache;
+    ConfigKey key = {a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts, top_k, thread_m_blocks, m_block_size_8, num_bits, group_size, has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem, cached_sms, is_sm90};
+    
+    auto it = exec_cfg_cache.find(key);
+    if (it != exec_cfg_cache.end()) {
+      exec_cfg = it->second;
+    } else {
       exec_cfg = determine_exec_config(
           a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
           top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
           has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
-          max_shared_mem, sms, is_sm90);
+          max_shared_mem, cached_sms, is_sm90);
+      // On SM90+ we prefer stages=5 but fall back to stages=4 when the chosen
+      // tile configuration does not fit in shared memory at depth 5.
+      if (is_sm90 && stages == 5 && exec_cfg.tb_cfg.thread_k == -1) {
+        stages = 4;
+        key.stages = 4;
+        exec_cfg = determine_exec_config(
+            a_type, b_type, c_type, s_type, prob_m, prob_n, prob_k, num_experts,
+            top_k, thread_m_blocks, m_block_size_8, num_bits, group_size,
+            has_act_order, is_k_full, has_zp, is_zp_float, is_a_8bit, stages,
+            max_shared_mem, cached_sms, is_sm90);
+      }
+      exec_cfg_cache[key] = exec_cfg;
     }
     thread_tfg = exec_cfg.tb_cfg;
   }
@@ -576,13 +617,17 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
+  int blocks = cached_sms * exec_cfg.blocks_per_sm;
   int logical_blocks = blocks;
 
   // Allow overriding the grid size for empirical benchmarking
-  const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
-  if (force_grid_env) {
-    blocks = std::atoi(force_grid_env);
+  static int cached_force_grid = -1;
+  if (cached_force_grid == -1) {
+    const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
+    cached_force_grid = force_grid_env ? std::atoi(force_grid_env) : 0;
+  }
+  if (cached_force_grid > 0) {
+    blocks = cached_force_grid;
   }
   logical_blocks = blocks;
   if (exec_cfg.blocks_per_sm > 1)
@@ -610,41 +655,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                             prob_n, prob_k, num_bits, group_size, has_act_order,
                             is_k_full, has_zp, is_zp_float, is_a_8bit, stages);
 
-  auto kernel = get_marlin_kernel(
-      a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
-      thread_k_blocks, m_block_size_8, has_act_order, has_zp, group_blocks,
-      num_threads, is_zp_float, stages);
-
-  if (kernel == MarlinDefault) {
-    TORCH_CHECK(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
-                ", ", prob_k, "]", ", has_act_order = ", has_act_order,
-                ", num_groups = ", num_groups, ", group_size = ", group_size,
-                ", thread_m_blocks = ", thread_m_blocks,
-                ", thread_n_blocks = ", thread_n_blocks,
-                ", thread_k_blocks = ", thread_k_blocks,
-                ", num_bits = ", num_bits);
-  }
-
-  // Cache cudaFuncSetAttribute to avoid heavy driver overhead on every launch
-  static std::unordered_set<const void*> configured_kernels;
-  static std::mutex config_mutex;
-  {
-    std::lock_guard<std::mutex> lock(config_mutex);
-    if (configured_kernels.find((const void*)kernel) == configured_kernels.end()) {
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                           cached_max_shared_mem); // Use the cached original device limit here
-      if (use_cluster_reduce) {
-        cudaFuncSetAttribute(kernel,
-                             cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-      }
-      configured_kernels.insert((const void*)kernel);
-    }
-  }
-
   int cluster_size = 1;
-  const char* force_cluster_env = std::getenv("MARLIN_MOE_FORCE_CLUSTER_REDUCE");
-  const bool force_cluster_reduce =
-      force_cluster_env != nullptr && force_cluster_env[0] == '1';
+  // Use a static variable to cache the environment variable read
+  static int cached_force_cluster_reduce = -1;
+  if (cached_force_cluster_reduce == -1) {
+    const char* force_cluster_env = std::getenv("MARLIN_MOE_FORCE_CLUSTER_REDUCE");
+    cached_force_cluster_reduce = (force_cluster_env != nullptr && force_cluster_env[0] == '1') ? 1 : 0;
+  }
+  const bool force_cluster_reduce = cached_force_cluster_reduce == 1;
   if (use_cluster_reduce && !force_cluster_reduce) {
     use_cluster_reduce = false;
     use_atomic_add = true;
@@ -660,11 +678,30 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   }
   if (use_cluster_reduce) {
     int parallel_padded = num_tokens_past_padded_count / moe_block_size;
-    StreamKHostParams sk = compute_streamk_host_params(
-        parallel_padded, prob_k, prob_n, thread_k_blocks, thread_n_blocks,
-        logical_blocks);
-    bool use_identity_cluster = can_use_identity_pair_cluster(
-        logical_blocks, cluster_size, sk.k_tiles, sk.iters, sk.part2_mn_tiles);
+    // Fast path: avoid compute_streamk_host_params and can_use_identity_pair_cluster
+    // if we can mathematically prove it's an identity cluster.
+    // For Stream-K, k_tiles = prob_k / 16 / thread_k_blocks
+    int k_tiles = prob_k / 16 / thread_k_blocks;
+    int n_tiles = prob_n / 16 / thread_n_blocks;
+    int global_mn_tiles = parallel_padded * n_tiles;
+    int part2_mn_tiles = global_mn_tiles;
+    if (global_mn_tiles > logical_blocks) {
+      part2_mn_tiles = global_mn_tiles % logical_blocks;
+      if (part2_mn_tiles * 3 <= logical_blocks) {
+        part2_mn_tiles += logical_blocks;
+      }
+    }
+    int iters = div_ceil(k_tiles * part2_mn_tiles, logical_blocks);
+    
+    // Inline the O(1) mathematical check from can_use_identity_pair_cluster
+    bool use_identity_cluster = (cluster_size == 2 && part2_mn_tiles < logical_blocks && 
+                                 iters * 2 == k_tiles && logical_blocks % 2 == 0);
+                                 
+    if (!use_identity_cluster) {
+      // Fallback to full check if the fast path fails
+      use_identity_cluster = can_use_identity_pair_cluster(
+          logical_blocks, cluster_size, k_tiles, iters, part2_mn_tiles);
+    }
 
     if (!use_identity_cluster) {
       use_cluster_reduce = false;
@@ -676,41 +713,55 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     } else {
       blocks = logical_blocks;
       cluster_cta_map_ptr = nullptr;
-      // We already set cudaFuncAttributeNonPortableClusterSizeAllowed in the
-      // cached configured_kernels block above, so we don't need to call it here again.
     }
   }
 
+  auto kernel = get_marlin_kernel(
+      a_type, b_type, c_type, s_type, thread_m_blocks, thread_n_blocks,
+      thread_k_blocks, m_block_size_8, has_act_order, has_zp, group_blocks,
+      num_threads, is_zp_float, stages, cluster_size);
+
+  if (kernel == MarlinDefault) {
+    TORCH_CHECK(false, "Unsupported shapes: MNK = [", prob_m, ", ", prob_n,
+                ", ", prob_k, "]", ", has_act_order = ", has_act_order,
+                ", num_groups = ", num_groups, ", group_size = ", group_size,
+                ", thread_m_blocks = ", thread_m_blocks,
+                ", thread_n_blocks = ", thread_n_blocks,
+                ", thread_k_blocks = ", thread_k_blocks,
+                ", num_bits = ", num_bits);
+  }
+
+  // Cache cudaFuncSetAttribute to avoid heavy driver overhead on every launch
+  static std::unordered_set<const void*> configured_kernels;
+  static std::mutex config_mutex;
+    // We can use a thread-local cache to avoid locking overhead on the hot path
+    thread_local std::unordered_set<const void*> tl_configured_kernels;
+    
+    if (tl_configured_kernels.find((const void*)kernel) == tl_configured_kernels.end()) {
+      bool needs_config = false;
+      {
+        std::lock_guard<std::mutex> lock(config_mutex);
+        if (configured_kernels.find((const void*)kernel) == configured_kernels.end()) {
+          needs_config = true;
+          configured_kernels.insert((const void*)kernel);
+        }
+      }
+      
+      if (needs_config) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             cached_max_shared_mem); // Use the cached original device limit here
+      }
+      tl_configured_kernels.insert((const void*)kernel);
+    }
+
   // avoid ">>>" being formatted to "> > >"
   // clang-format off
-  if (use_cluster_reduce && cluster_size > 1) {
-    cudaLaunchConfig_t config{};
-    config.gridDim = blocks;
-    config.blockDim = num_threads;
-    config.dynamicSmemBytes = max_shared_mem;
-    config.stream = stream;
-    cudaLaunchAttribute attr{};
-    attr.id = cudaLaunchAttributeClusterDimension;
-    attr.val.clusterDim.x = cluster_size;
-    attr.val.clusterDim.y = 1;
-    attr.val.clusterDim.z = 1;
-    config.attrs = &attr;
-    config.numAttrs = 1;
-    cudaLaunchKernelEx(
-        &config, kernel, A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr,
-        b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr, sorted_token_ids_ptr,
-        expert_ids_ptr, num_tokens_past_padded_ptr, topk_weights_ptr, top_k,
-        mul_topk_weights, num_groups, prob_m, prob_n, prob_k, logical_blocks,
-        cluster_cta_map_ptr, locks, has_bias, use_atomic_add, use_fp32_reduce,
-        use_cluster_reduce);
-  } else {
-    kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
-        A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
-        sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
-        topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
-        prob_n, prob_k, logical_blocks, cluster_cta_map_ptr, locks, has_bias,
-        use_atomic_add, use_fp32_reduce, use_cluster_reduce);
-  }
+  kernel<<<blocks, num_threads, max_shared_mem, stream>>>(
+      A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, a_s_ptr, b_s_ptr, g_s_ptr, zp_ptr, g_idx_ptr,
+      sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
+      topk_weights_ptr, top_k, mul_topk_weights, num_groups, prob_m,
+      prob_n, prob_k, logical_blocks, cluster_cta_map_ptr, locks, has_bias,
+      use_atomic_add, use_fp32_reduce, use_cluster_reduce);
   // clang-format on
 }
 
@@ -1045,13 +1096,13 @@ torch::Tensor moe_wna16_marlin_gemm(
   int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
   int num_tokens_past_padded_count = num_tokens_past_padded.item<int>();
   int parallel_padded = num_tokens_past_padded_count / (int)moe_block_size;
-  int min_workspace_size = min(max_n_tiles * parallel_padded, sms * 4);
+  int min_workspace_size = min(max_n_tiles * parallel_padded, cached_sms * 4);
 
   int dev = a.get_device();
   
   // We already fetched major_capability via cache earlier in the function
   
-  if (!use_cluster_reduce) {
+  if (!use_cluster_reduce || cached_major_capability < 9) {
     use_cluster_reduce = false;
     if (!force_lock_reduce) {
       use_atomic_add = true;
@@ -1059,7 +1110,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   if (use_cluster_reduce) {
     // We assume blocks_per_sm is at most 2 for cluster reduce sizing
-    int max_logical_blocks = sms * 2;
+    int max_logical_blocks = cached_sms * 2;
     min_workspace_size += max_logical_blocks * 2;
   }
 
@@ -1087,7 +1138,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-      thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
+      thread_k, thread_n, cached_sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
       is_zp_float, num_tokens_past_padded_count, use_cluster_reduce);
 
   return c;

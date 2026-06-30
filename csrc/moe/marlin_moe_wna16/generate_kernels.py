@@ -62,7 +62,8 @@ TEMPLATE = (
     "{{m_block_size_8}}, "
     "{{stages}}, "
     "{{group_blocks}}, "
-    "{{is_zp_float}}>"
+    "{{is_zp_float}}, "
+    "{{cluster_size}}>"
     "( MARLIN_KERNEL_PARAMS );"
 )
 
@@ -232,6 +233,7 @@ def generate_new_kernels():
                     "stages": 4,
                     "group_blocks": group_blocks,
                     "is_zp_float": "false",
+                    "cluster_size": 1,
                 }
 
                 if SUPPORT_SM80:
@@ -245,7 +247,13 @@ def generate_new_kernels():
                 if (a_type, b_type, c_type) in sm_90_result_dict and SUPPORT_SM90:
                     config_sm90 = config.copy()
                     config_sm90["stages"] = 5
+                    config_sm90["cluster_size"] = 1
                     sm_90_result_dict[(a_type, b_type, c_type)].append(config_sm90)
+                    
+                    # Add cluster_size=2 for SM90
+                    config_sm90_c2 = config_sm90.copy()
+                    config_sm90_c2["cluster_size"] = 2
+                    sm_90_result_dict[(a_type, b_type, c_type)].append(config_sm90_c2)
 
     kernel_selector_str = FILE_HEAD_COMMENT
 
@@ -278,6 +286,7 @@ def generate_new_kernels():
                     f"stages == {config['stages']}",
                     f"group_blocks == {config['group_blocks']}",
                     f"is_zp_float == {config['is_zp_float']}",
+                    f"cluster_size == {config['cluster_size']}",
                 ]
                 conditions = " && ".join(conditions)
 
@@ -291,7 +300,7 @@ def generate_new_kernels():
                     "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
                     "{{thread_n_blocks}}, {{thread_k_blocks}}, "
                     "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
-                    "{{is_zp_float}}>;"
+                    "{{is_zp_float}}, {{cluster_size}}>;"
                 )
 
                 kernel_selector_str += (

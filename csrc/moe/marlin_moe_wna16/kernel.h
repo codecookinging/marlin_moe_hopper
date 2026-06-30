@@ -42,8 +42,12 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const int cluster_size = 1 // cluster size for DSMEM reduce
           >
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+__cluster_dims__(cluster_size, 1, 1)
+#endif
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
 
 }
