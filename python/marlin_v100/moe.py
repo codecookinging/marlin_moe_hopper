@@ -8,14 +8,18 @@ from . import ops
 _MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
 
 def get_adaptive_moe_block_size(m: int, topk: int, num_experts: int, input_dtype=None) -> int:
-    block_size_m = 64
-    for candidate in _MOE_BLOCK_SIZE_CANDIDATES:
-        # If the average tokens per expert is significantly less than the candidate block size,
-        # we shrink the block size to reduce padding overhead.
-        if m * topk / num_experts / candidate < 0.9:
-            block_size_m = candidate
-        else:
-            break
+    if m < 1024:
+        block_size_m = 16
+    else:
+        block_size_m = 64
+        for candidate in _MOE_BLOCK_SIZE_CANDIDATES:
+            # If the average tokens per expert is significantly less than the candidate block size,
+            # we shrink the block size to reduce padding overhead.
+            if m * topk / num_experts / candidate < 0.9:
+                block_size_m = candidate
+            else:
+                break
+                
     if input_dtype is not None and input_dtype.itemsize == 1:
         block_size_m = max(block_size_m, 16)
     return block_size_m
