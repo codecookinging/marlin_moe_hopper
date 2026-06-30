@@ -1138,7 +1138,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       mul_topk_weights, size_m, size_n, size_k, workspace.data_ptr(), a_type,
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
-      thread_k, thread_n, cached_sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
+      thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
       is_zp_float, num_tokens_past_padded_count, use_cluster_reduce);
 
   return c;
