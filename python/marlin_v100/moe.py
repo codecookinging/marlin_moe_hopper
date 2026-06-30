@@ -5,6 +5,43 @@ import torch
 from . import ops
 
 
+_SHORT_BATCH_M_THRESHOLD = 2048
+_SHORT_BATCH_MOE_BLOCK_SIZE = 16
+_MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
+
+
+def get_adaptive_moe_block_size(
+    m: int, topk: int, num_experts: int, input_dtype=None
+) -> int:
+    """Pick MoE align block size.
+
+    Short batch (m < 1024) always uses 16 tokens/block so the Marlin kernel
+    stays on thread_m_blocks == 1 (small-batch tile table). Long batch may use
+    up to 64 when expert load is dense enough.
+    """
+    if m <= _SHORT_BATCH_M_THRESHOLD:
+        block_size_m = _SHORT_BATCH_MOE_BLOCK_SIZE
+    else:
+        block_size_m = 64
+        for candidate in _MOE_BLOCK_SIZE_CANDIDATES:
+            # If the average tokens per expert is significantly less than the
+            # candidate block size, shrink the block to reduce padding overhead.
+            if m * topk / num_experts / candidate < 0.9:
+                block_size_m = candidate
+            else:
+                break
+
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, _SHORT_BATCH_MOE_BLOCK_SIZE)
+    return block_size_m
+
+
+def normalize_moe_block_size(moe_block_size: int, m: int) -> int:
+    """Force short-batch launches onto thread_m_blocks == 1."""
+    if m < _SHORT_BATCH_M_THRESHOLD and moe_block_size > _SHORT_BATCH_MOE_BLOCK_SIZE:
+        return _SHORT_BATCH_MOE_BLOCK_SIZE
+    return moe_block_size
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,
@@ -37,7 +74,7 @@ def fused_marlin_moe(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     quant_type_id: int,
-    moe_block_size: int = 16,
+    moe_block_size: int | None = None,
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     workspace: torch.Tensor | None = None,
@@ -60,6 +97,14 @@ def fused_marlin_moe(
         raise ValueError(
             f"Expected first-layer MoE scale width to be even, got {intermediate_size}."
         )
+
+    if moe_block_size is None:
+        moe_block_size = get_adaptive_moe_block_size(
+            m, topk, w1.shape[0], hidden_states.dtype
+        )
+    else:
+        moe_block_size = normalize_moe_block_size(moe_block_size, m)
+
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )

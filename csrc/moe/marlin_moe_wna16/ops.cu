@@ -131,7 +131,6 @@ thread_config_t small_batch_thread_configs[] = {
     // {128, 128, 256},
     // {64, 128, 128},
     // {128, 64, 128},
-    // {128, 256, 256},
   };
 
 thread_config_t large_batch_thread_configs[] = {
@@ -319,7 +318,7 @@ exec_config_t determine_exec_config(
     int reg_size = max(attr.numRegs, 1) * th_config.num_threads * 4;
     int allow_count = min(device_max_reg_size / reg_size,
                           max_shared_mem / (cache_size + 1536));
-    printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
+    // printf("allow_count = %d, thread_m_blocks = %d, thread_k = %d, thread_n = %d, num_threads = %d\n", allow_count, thread_m_blocks, th_config.thread_k, th_config.thread_n, th_config.num_threads);
       if (thread_m_blocks == 1)
       allow_count = max(min(allow_count, 4), 1);
       else
@@ -498,8 +497,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-  printf("blocks_per_sm = %d, sms = %d, num_threads = %d, thread_k = %d, thread_n = %d\n",
-         exec_cfg.blocks_per_sm, sms, num_threads, thread_k, thread_n);
+  printf(
+      "moe_block_size=%d thread_m_blocks=%d blocks_per_sm=%d sms=%d "
+      "num_threads=%d thread_k=%d thread_n=%d prob_m=%d\n",
+      moe_block_size, thread_m_blocks, exec_cfg.blocks_per_sm, sms, num_threads,
+      thread_k, thread_n, prob_m);
 
   // Allow overriding the grid size for empirical benchmarking
   const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
