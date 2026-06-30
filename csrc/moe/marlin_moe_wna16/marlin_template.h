@@ -667,6 +667,10 @@ __global__ void Marlin(
 
   init_slice();
 
+  if (block_num_valid_tokens == 0 && slice_count == 1) {
+    return;
+  }
+
   // A sizes/strides
 
   // stride of the A matrix in global memory
@@ -1499,6 +1503,7 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
+        if (i * 16 >= block_num_valid_tokens) break;
         mma<a_type_id, false, 32>(
             frag_a[k2][i], frag_b[0],
             (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
@@ -1520,6 +1525,7 @@ __global__ void Marlin(
 
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
+              if (i * 16 >= block_num_valid_tokens) break;
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 int scale = reinterpret_cast<int*>(&s_vals[0])[g % 2];
@@ -1558,6 +1564,7 @@ __global__ void Marlin(
 
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
+              if (i * 16 >= block_num_valid_tokens) break;
   #pragma unroll
               for (int g = 0; g < 4; g++) {
                 float scale = reinterpret_cast<float*>(&s_vals[0])[g % 2];
@@ -2246,6 +2253,9 @@ __global__ void Marlin(
       }
       is_first_matmul_in_slice = true;
       init_slice();
+      if (block_num_valid_tokens == 0 && slice_count == 1) {
+        return;
+      }
 
       if (slice_iters) {
         a_gl_rd_col =
