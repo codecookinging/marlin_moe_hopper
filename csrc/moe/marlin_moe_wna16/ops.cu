@@ -133,7 +133,7 @@ thread_config_t small_batch_thread_configs[] = {
     // thread_k, thread_n, num_threads
     {64, 256, 128},
     // {128, 128, 256},
-    // {64, 128, 128},
+    {64, 128, 128},
     // {128, 64, 128},
     // {128, 256, 256},
   };
