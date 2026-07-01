@@ -5,10 +5,10 @@ import torch
 from . import ops
 
 
-_SHORT_BATCH_M_THRESHOLD = 2048
+_SHORT_BATCH_M_THRESHOLD = 512
 _SHORT_BATCH_MOE_BLOCK_SIZE = 16
 _MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
-
+ß
 
 def get_adaptive_moe_block_size(
     m: int, topk: int, num_experts: int, input_dtype=None
