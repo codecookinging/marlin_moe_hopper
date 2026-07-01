@@ -940,6 +940,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   bool use_cluster_reduce = false;
   const char* cluster_reduce_env = std::getenv("MARLIN_MOE_USE_CLUSTER_REDUCE");
   if (cluster_reduce_env != nullptr && cluster_reduce_env[0] == '1') {
+    printf("check use_cluster_reduce\n");
     use_cluster_reduce = true;
     if (!force_lock_reduce) {
       use_atomic_add = false;
@@ -1103,12 +1104,14 @@ torch::Tensor moe_wna16_marlin_gemm(
   // We already fetched major_capability via cache earlier in the function
   
   if (!use_cluster_reduce) {
+    printf("not use use_cluster_reduce\n");
     use_cluster_reduce = false;
     if (!force_lock_reduce) {
       use_atomic_add = true;
     }
   }
   if (use_cluster_reduce) {
+    printf("use use_cluster_reduce\n");
     // We assume blocks_per_sm is at most 2 for cluster reduce sizing
     int max_logical_blocks = sms * 2;
     min_workspace_size += max_logical_blocks * 2;

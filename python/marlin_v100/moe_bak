@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+
+import torch
+
+from . import ops
+
+
+def _log_fused_marlin_moe(**fields: object) -> None:
+    if os.environ.get("MARLIN_MOE_LOG", "1") == "0":
+        return
+    log_path = os.environ.get("MARLIN_MOE_LOG_PATH", "/tmp/fused_marlin_moe.log")
+    fields = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        **fields,
+    }
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(fields, sort_keys=True) + "\n")
+
+
+_MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
+
+def get_adaptive_moe_block_size(m: int, topk: int, num_experts: int, input_dtype=None) -> int:
+    if m <= 2048:
+        block_size_m = 16
+    else:
+        block_size_m = 64
+        for candidate in _MOE_BLOCK_SIZE_CANDIDATES:
+            # If the average tokens per expert is significantly less than the candidate block size,
+            # we shrink the block size to reduce padding overhead.
+            if m * topk / num_experts / candidate < 0.9:
+                block_size_m = candidate
+            else:
+                break
+                
+    if input_dtype is not None and input_dtype.itemsize == 1:
+        block_size_m = max(block_size_m, 16)
+    return block_size_m
+
+def moe_align_block_size(
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    expert_map: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
+    sorted_ids = torch.empty((max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device)
+    max_num_m_blocks = max_num_tokens_padded // block_size + 1
+    expert_ids = torch.empty((max_num_m_blocks,), dtype=torch.int32, device=topk_ids.device)
+    num_tokens_post_pad = torch.empty((1,), dtype=torch.int32, device=topk_ids.device)
+    ops.moe_align_block_size(
+        topk_ids,
+        num_experts,
+        block_size,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        expert_map,
+    )
+    return sorted_ids, expert_ids, num_tokens_post_pad
+
+
+def fused_marlin_moe(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    quant_type_id: int,
+    moe_block_size: int | None = None,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    workspace: torch.Tensor | None = None,
+    global_scale1: torch.Tensor | None = None,
+    global_scale2: torch.Tensor | None = None,
+    g_idx1: torch.Tensor | None = None,
+    g_idx2: torch.Tensor | None = None,
+    sort_indices1: torch.Tensor | None = None,
+    sort_indices2: torch.Tensor | None = None,
+    w1_zeros: torch.Tensor | None = None,
+    w2_zeros: torch.Tensor | None = None,
+    is_k_full: bool = True,
+) -> torch.Tensor:
+    m, k = hidden_states.shape
+    topk = topk_ids.shape[1]
+    intermediate_size = w1_scale.shape[2]
+    n = intermediate_size // 2
+    output_size = w2_scale.shape[2]
+    if intermediate_size % 2 != 0:
+        raise ValueError(
+            f"Expected first-layer MoE scale width to be even, got {intermediate_size}."
+        )
+
+    if moe_block_size is None:
+        moe_block_size = get_adaptive_moe_block_size(
+            m, topk, w1.shape[0], hidden_states.dtype
+        )
+
+    num_experts = w1.shape[0]
+    sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
+        topk_ids, moe_block_size, num_experts
+    )
+    num_tokens_padded = int(num_tokens_post_pad.item())
+    _log_fused_marlin_moe(
+        m=m,
+        n=n,
+        k=k,
+        num_topk=topk,
+        block_size_m=moe_block_size,
+        num_experts=num_experts,
+        intermediate_size=intermediate_size,
+        output_size=output_size,
+        num_tokens_padded=num_tokens_padded,
+        parallel=num_tokens_padded // moe_block_size,
+        quant_type_id=quant_type_id,
+        input_dtype=str(hidden_states.dtype),
+        is_k_full=is_k_full,
+    )
+    if workspace is None:
+        props = torch.cuda.get_device_properties(hidden_states.device)
+        max_blocks_per_sm = 6 if props.major >= 9 else 4
+        workspace_elems = props.multi_processor_count * max_blocks_per_sm
+        if props.major >= 9:
+            workspace_elems *= 2
+        workspace = torch.zeros(
+            workspace_elems,
+            dtype=torch.int,
+            device=hidden_states.device,
+        )
+
+    intermediate = torch.empty(
+        (m * topk, intermediate_size),
+        dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    intermediate = ops.moe_wna16_marlin_gemm(
+        hidden_states,
+        intermediate,
+        w1,
+        bias1,
+        w1_scale,
+        None,
+        global_scale1,
+        w1_zeros,
+        g_idx1,
+        sort_indices1,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        topk,
+        False,
+        quant_type_id,
+        m,
+        intermediate_size,
+        k,
+        is_k_full,
+        False,
+        True,
+        False,
+        -1,
+        -1,
+        -1,
+    )
+    gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
+    activated = torch.nn.functional.silu(gate) * up
+    output = torch.empty(
+        (m * topk, output_size), dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    output = ops.moe_wna16_marlin_gemm(
+        activated,
+        output,
+        w2,
+        bias2,
+        w2_scale,
+        None,
+        global_scale2,
+        w2_zeros,
+        g_idx2,
+        sort_indices2,
+        workspace,
+        sorted_ids,
+        expert_ids,
+        num_tokens_post_pad,
+        topk_weights,
+        moe_block_size,
+        1,
+        True,
+        quant_type_id,
+        m * topk,
+        output_size,
+        n,
+        is_k_full,
+        False,
+        True,
+        False,
+        -1,
+        -1,
+        -1,
+    )
+    return output.view(m, topk, output_size).sum(dim=1)
