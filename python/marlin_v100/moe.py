@@ -8,7 +8,6 @@ from . import ops
 _SHORT_BATCH_M_THRESHOLD = 512
 _SHORT_BATCH_MOE_BLOCK_SIZE = 16
 _MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
-ß
 
 def get_adaptive_moe_block_size(
     m: int, topk: int, num_experts: int, input_dtype=None
@@ -99,15 +98,49 @@ def fused_marlin_moe(
         )
 
     if moe_block_size is None:
-        moe_block_size = get_adaptive_moe_block_size(
-            m, topk, w1.shape[0], hidden_states.dtype
-        )
+        if m <= _SHORT_BATCH_M_THRESHOLD:
+            moe_block_size = _SHORT_BATCH_MOE_BLOCK_SIZE
+            do_split = False
+        else:
+            moe_block_size = _SHORT_BATCH_MOE_BLOCK_SIZE
+            do_split = True
     else:
         moe_block_size = normalize_moe_block_size(moe_block_size, m)
+        do_split = False
 
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
     )
+    
+    if do_split:
+        num_experts = w1.shape[0]
+        total_blocks = num_tokens_post_pad.item() // 16
+        
+        expert_ids = expert_ids[:total_blocks]
+        sorted_ids = sorted_ids[:total_blocks * 16]
+        
+        valid_topk_ids = topk_ids[topk_ids >= 0]
+        expert_counts = torch.bincount(valid_topk_ids.flatten(), minlength=num_experts)
+        
+        block_indices = torch.arange(total_blocks, device=expert_ids.device)
+        expert_block_counts = torch.bincount(expert_ids, minlength=num_experts)
+        expert_block_offsets = torch.cumsum(expert_block_counts, dim=0) - expert_block_counts
+        block_expert_idx = block_indices - expert_block_offsets[expert_ids]
+        
+        is_full_block = block_expert_idx < (expert_counts[expert_ids] // 64) * 4
+        
+        full_block_mask = is_full_block
+        partial_block_mask = ~is_full_block
+        
+        sorted_ids_2d = sorted_ids.view(-1, 16)
+        
+        full_sorted_ids = sorted_ids_2d[full_block_mask].view(-1)
+        full_expert_ids = expert_ids[full_block_mask][::4]
+        full_num_tokens = torch.tensor([full_sorted_ids.numel()], dtype=torch.int32, device=expert_ids.device)
+        
+        partial_sorted_ids = sorted_ids_2d[partial_block_mask].view(-1)
+        partial_expert_ids = expert_ids[partial_block_mask]
+        partial_num_tokens = torch.tensor([partial_sorted_ids.numel()], dtype=torch.int32, device=expert_ids.device)
     if workspace is None:
         props = torch.cuda.get_device_properties(hidden_states.device)
         max_blocks_per_sm = 6 if props.major >= 9 else 4
@@ -122,71 +155,105 @@ def fused_marlin_moe(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    intermediate = ops.moe_wna16_marlin_gemm(
-        hidden_states,
-        intermediate,
-        w1,
-        bias1,
-        w1_scale,
-        None,
-        global_scale1,
-        w1_zeros,
-        g_idx1,
-        sort_indices1,
-        workspace,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        topk_weights,
-        moe_block_size,
-        topk,
-        False,
-        quant_type_id,
-        m,
-        intermediate_size,
-        k,
-        is_k_full,
-        False,
-        True,
-        False,
-        -1,
-        -1,
-        -1,
-    )
+    
+    if not do_split:
+        intermediate = ops.moe_wna16_marlin_gemm(
+            hidden_states,
+            intermediate,
+            w1,
+            bias1,
+            w1_scale,
+            None,
+            global_scale1,
+            w1_zeros,
+            g_idx1,
+            sort_indices1,
+            workspace,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            topk_weights,
+            moe_block_size,
+            topk,
+            False,
+            quant_type_id,
+            m,
+            intermediate_size,
+            k,
+            is_k_full,
+            False,
+            True,
+            False,
+            -1,
+            -1,
+            -1,
+        )
+    else:
+        if full_sorted_ids.numel() > 0:
+            ops.moe_wna16_marlin_gemm(
+                hidden_states, intermediate, w1, bias1, w1_scale, None, global_scale1, w1_zeros, g_idx1, sort_indices1,
+                workspace, full_sorted_ids, full_expert_ids, full_num_tokens, topk_weights,
+                64, topk, False, quant_type_id, m, intermediate_size, k,
+                is_k_full, False, True, False, -1, -1, -1
+            )
+        if partial_sorted_ids.numel() > 0:
+            ops.moe_wna16_marlin_gemm(
+                hidden_states, intermediate, w1, bias1, w1_scale, None, global_scale1, w1_zeros, g_idx1, sort_indices1,
+                workspace, partial_sorted_ids, partial_expert_ids, partial_num_tokens, topk_weights,
+                16, topk, False, quant_type_id, m, intermediate_size, k,
+                is_k_full, False, True, False, -1, -1, -1
+            )
     gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
     output = torch.empty(
         (m * topk, output_size), dtype=hidden_states.dtype, device=hidden_states.device
     )
-    output = ops.moe_wna16_marlin_gemm(
-        activated,
-        output,
-        w2,
-        bias2,
-        w2_scale,
-        None,
-        global_scale2,
-        w2_zeros,
-        g_idx2,
-        sort_indices2,
-        workspace,
-        sorted_ids,
-        expert_ids,
-        num_tokens_post_pad,
-        topk_weights,
-        moe_block_size,
-        1,
-        True,
-        quant_type_id,
-        m * topk,
-        output_size,
-        n,
-        is_k_full,
-        False,
-        True,
-        False,
-        -1,
-        -1,
-        -1,
-    )
+    
+    if not do_split:
+        output = ops.moe_wna16_marlin_gemm(
+            activated,
+            output,
+            w2,
+            bias2,
+            w2_scale,
+            None,
+            global_scale2,
+            w2_zeros,
+            g_idx2,
+            sort_indices2,
+            workspace,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            topk_weights,
+            moe_block_size,
+            1,
+            True,
+            quant_type_id,
+            m * topk,
+            output_size,
+            n,
+            is_k_full,
+            False,
+            True,
+            False,
+            -1,
+            -1,
+            -1,
+        )
+    else:
+        if full_sorted_ids.numel() > 0:
+            ops.moe_wna16_marlin_gemm(
+                activated, output, w2, bias2, w2_scale, None, global_scale2, w2_zeros, g_idx2, sort_indices2,
+                workspace, full_sorted_ids, full_expert_ids, full_num_tokens, topk_weights,
+                64, 1, True, quant_type_id, m * topk, output_size, n,
+                is_k_full, False, True, False, -1, -1, -1
+            )
+        if partial_sorted_ids.numel() > 0:
+            ops.moe_wna16_marlin_gemm(
+                activated, output, w2, bias2, w2_scale, None, global_scale2, w2_zeros, g_idx2, sort_indices2,
+                workspace, partial_sorted_ids, partial_expert_ids, partial_num_tokens, topk_weights,
+                16, 1, True, quant_type_id, m * topk, output_size, n,
+                is_k_full, False, True, False, -1, -1, -1
+            )
     return output.view(m, topk, output_size).sum(dim=1)
