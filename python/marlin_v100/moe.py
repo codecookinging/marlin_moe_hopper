@@ -8,7 +8,7 @@ from . import ops
 _MOE_BLOCK_SIZE_CANDIDATES = [64, 32, 16, 8]
 
 def get_adaptive_moe_block_size(m: int, topk: int, num_experts: int, input_dtype=None) -> int:
-    if m <= 1024:
+    if m <= 2048:
         block_size_m = 16
     else:
         block_size_m = 64
