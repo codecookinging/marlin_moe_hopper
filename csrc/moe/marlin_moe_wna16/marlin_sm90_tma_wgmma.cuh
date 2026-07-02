@@ -372,17 +372,18 @@ __device__ void gather_a_stage(const Params& params, const TileWork& work,
   const int32_t* sorted =
       params.sorted_token_ids + work.par_id * moe_block_size;
   const int k_base = k_stage_idx * 64;
-  const int row0 = threadIdx.x / 64;
-  const int col = threadIdx.x & 63;
 
-  for (int row = row0; row < 64; row += blockDim.x / 64) {
-    half val = __float2half(0.0f);
+  const int total_int4s = (64 * 64) / 8;
+  for (int i = threadIdx.x; i < total_int4s; i += blockDim.x) {
+    int row = i / 8;
+    int col_chunk = i % 8;
+    int4 val = {0, 0, 0, 0};
     if (row < work.valid_m) {
       int64_t token = sorted[row] / params.top_k;
-      const half* a_half = reinterpret_cast<const half*>(params.A);
-      val = a_half[token * params.prob_k + k_base + col];
+      const int4* a_int4 = reinterpret_cast<const int4*>(params.A);
+      val = a_int4[token * (params.prob_k / 8) + (k_base / 8) + col_chunk];
     }
-    sh_a[row * 64 + col] = val;
+    reinterpret_cast<int4*>(sh_a)[i] = val;
   }
 }
 
@@ -407,7 +408,6 @@ __device__ void copy_b_packed_stage(const Params& params, const TileWork& work,
       tma_load_2d_b_tile(sh_b_packed, params.B_tma_map, packed_col,
                          packed_row, &barrier[pipe]);
     }
-    mbarrier_wait<0>(&barrier[pipe]);
     return;
   }
 
@@ -451,21 +451,30 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
   const int group_size = params.group_size > 0 ? params.group_size : params.prob_k;
   const int scales_expert_stride = params.prob_n * params.prob_k / group_size;
 
-  for (int linear = threadIdx.x; linear < elements; linear += blockDim.x) {
-    int k = linear / nPanel;
-    int n = linear - k * nPanel;
-    int global_k = k_stage_idx * kStage + k;
-    int global_n = work.n_panel * nPanel + n;
+  for (int i = threadIdx.x; i < elements / 8; i += blockDim.x) {
+    int linear_start = i * 8;
+    int k = linear_start / nPanel;
+    int n_start = linear_start % nPanel;
+    
+    uint32_t regs[4];
+    half* h_regs = reinterpret_cast<half*>(regs);
 
-    int q = unpack_quant<b_bits>(packed, linear);
-    // Symmetric unsigned Marlin prototype: center U4/U8 around zero before
-    // scaling.  Exact GPTQ/AWQ permutations remain isolated to this producer.
-    float centered = static_cast<float>(q) -
-                     static_cast<float>((1 << b_bits) - 1) * 0.5f;
-    int scale_idx = work.expert_id * scales_expert_stride +
-                    (global_k / group_size) * params.prob_n + global_n;
-    half scale = load_half_scale(params.scales, scale_idx);
-    sh_b_dequant[linear] = __float2half(centered * __half2float(scale));
+#pragma unroll
+    for (int j = 0; j < 8; j++) {
+      int linear = linear_start + j;
+      int n = n_start + j;
+      int global_k = k_stage_idx * kStage + k;
+      int global_n = work.n_panel * nPanel + n;
+
+      int q = unpack_quant<b_bits>(packed, linear);
+      float centered = static_cast<float>(q) -
+                       static_cast<float>((1 << b_bits) - 1) * 0.5f;
+      int scale_idx = work.expert_id * scales_expert_stride +
+                      (global_k / group_size) * params.prob_n + global_n;
+      half scale = load_half_scale(params.scales, scale_idx);
+      h_regs[j] = __float2half(centered * __half2float(scale));
+    }
+    reinterpret_cast<int4*>(sh_b_dequant)[i] = *reinterpret_cast<int4*>(regs);
   }
 }
 
@@ -563,28 +572,66 @@ __device__ void run_dataflow(const Params& params, TileWork work, void* smem) {
   float accum[64] = {};
 
   for (int i = threadIdx.x; i < stages; i += blockDim.x) {
-    mbarrier_init(&sh.barriers[i], blockDim.x);
+    mbarrier_init(&sh.barriers[i], 1); // Only thread 0 arrives for TMA
   }
   __syncthreads();
 
-  for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end;
-       k_stage++) {
+  // Prologue
+  for (int pipe = 0; pipe < stages - 1; pipe++) {
+    int k_stage = work.k_stage_begin + pipe;
+    if (k_stage < work.k_stage_end) {
+      gather_a_stage<moe_block_size>(params, work, k_stage, sh.a_stage(pipe));
+      copy_b_packed_stage<b_bits>(params, work, pipe, k_stage,
+                                  sh.b_packed_stage(pipe), sh.barriers);
+    }
+  }
+  __syncthreads();
+
+  for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end; k_stage++) {
     int pipe = (k_stage - work.k_stage_begin) % stages;
-    gather_a_stage<moe_block_size>(params, work, k_stage, sh.a_stage(pipe));
-    copy_b_packed_stage<b_bits>(params, work, pipe, k_stage,
-                                sh.b_packed_stage(pipe), sh.barriers);
-    __syncthreads();
+    int next_k_stage = k_stage + stages - 1;
+    int next_pipe = next_k_stage % stages;
+
+    // Issue next fetch
+    if (next_k_stage < work.k_stage_end) {
+      gather_a_stage<moe_block_size>(params, work, next_k_stage, sh.a_stage(next_pipe));
+      copy_b_packed_stage<b_bits>(params, work, next_pipe, next_k_stage,
+                                  sh.b_packed_stage(next_pipe), sh.barriers);
+    }
+
+    // Wait for current fetch
+    if (params.use_tma_load && params.B_tma_map != nullptr) {
+      uint32_t smem_bar = static_cast<uint32_t>(__cvta_generic_to_shared(&sh.barriers[pipe]));
+      int phase = ((k_stage - work.k_stage_begin) / stages) & 1;
+      asm volatile(
+          "{\n"
+          "  .reg .pred p;\n"
+          "wait_loop:\n"
+          "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+          "  @!p bra wait_loop;\n"
+          "}\n" ::"r"(smem_bar), "n"(phase));
+    }
+    __syncthreads(); // Ensure manual copies (A gather and fallback B) are done
+
+    // Dequantize B
     dequant_b_stage_to_wgmma_shared<b_bits>(params, work, k_stage,
                                             sh.b_packed_stage(pipe),
                                             sh.b_dequant_stage(pipe));
-    __syncthreads();
+    __syncthreads(); // Wait for dequant to finish
 
+    // Issue WGMMA
     wgmma_fence();
     warpgroup_mma_accumulate<stages, b_bits>(sh, pipe, accum);
     wgmma_commit_group();
-    wgmma_wait_group<0>();
+
+    if constexpr (stages >= 3) {
+      wgmma_wait_group<stages - 2>();
+    } else {
+      wgmma_wait_group<0>();
+    }
   }
 
+  wgmma_wait_group<0>();
   store_tile<moe_block_size>(params, work, accum);
 }
 
