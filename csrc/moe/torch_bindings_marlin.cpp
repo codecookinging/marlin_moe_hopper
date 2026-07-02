@@ -44,7 +44,7 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "int size_m, int size_n, int size_k,"
       "bool is_k_full, bool use_atomic_add,"
       "bool use_fp32_reduce, bool is_zp_float,"
-      "int thread_k, int thread_n, int blocks_per_sm) -> Tensor");
+      "int thread_k, int thread_n, int blocks_per_sm, bool use_tma) -> Tensor");
 
   m.def(
       "grouped_topk(Tensor scores, int n_group, int "

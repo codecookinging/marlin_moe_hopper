@@ -494,7 +494,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks) {
+               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks, bool use_tma) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -607,13 +607,105 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     TORCH_CHECK(tensor_map_abi.supported,
                 "SM90 TMA/WGMMA path is not available: ",
                 tensor_map_abi.reason);
-    TORCH_CHECK(false,
-                "SM90 TMA/WGMMA dataflow/tile path is selected, but the "
-                "runnable launch is not enabled yet. B tensor-map ABI, "
-                "shared-memory B dequant, WGMMA accumulator layout, and "
-                "epilogue store/reduce are defined in marlin_sm90_tma_wgmma.cuh; "
-                "remaining host work is to create CUtensorMap descriptors for "
-                "B and switch this guard to the SM90 launch.");
+    CUtensorMap tma_map_host;
+    uint64_t globalDim[2] = {
+        static_cast<uint64_t>(prob_n * b_type.size_bits() / 32),
+        static_cast<uint64_t>(num_experts * prob_k)
+    };
+    uint64_t globalStrides[1] = { globalDim[0] * sizeof(uint32_t) };
+    uint32_t boxDim[2] = {
+        static_cast<uint32_t>(128 * b_type.size_bits() / 32),
+        static_cast<uint32_t>(64)
+    };
+    uint32_t elementStrides[2] = {1, 1};
+
+    CUresult res = cuTensorMapEncodeTiled(
+        &tma_map_host,
+        CU_TENSOR_MAP_DATA_TYPE_UINT32,
+        2,
+        const_cast<void*>(B),
+        globalDim,
+        globalStrides,
+        boxDim,
+        elementStrides,
+        CU_TENSOR_MAP_INTERLEAVE_NONE,
+        CU_TENSOR_MAP_SWIZZLE_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    
+    TORCH_CHECK(res == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed with error code ", res);
+
+    void* tma_map_dev = nullptr;
+    cudaMallocAsync(&tma_map_dev, sizeof(CUtensorMap), stream);
+    cudaMemcpyAsync(tma_map_dev, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice, stream);
+
+    marlin_sm90_tma_wgmma::Params params;
+    params.A = reinterpret_cast<const int4*>(A);
+    params.B = reinterpret_cast<const int4*>(B);
+    params.B_tma_map = tma_map_dev;
+    params.C = reinterpret_cast<int4*>(C);
+    params.C_tmp = reinterpret_cast<int4*>(C_tmp);
+    params.scales = reinterpret_cast<const int4*>(b_s);
+    params.sorted_token_ids = reinterpret_cast<const int32_t*>(sorted_token_ids);
+    params.expert_ids = reinterpret_cast<const int32_t*>(expert_ids);
+    params.num_tokens_past_padded = reinterpret_cast<const int32_t*>(num_tokens_past_padded);
+    params.topk_weights = reinterpret_cast<const float*>(topk_weights);
+    params.locks = reinterpret_cast<int*>(workspace);
+    params.prob_m = prob_m;
+    params.prob_n = prob_n;
+    params.prob_k = prob_k;
+    params.top_k = top_k;
+    params.moe_block_size = moe_block_size;
+    params.num_groups = num_groups;
+    params.group_size = group_size;
+    params.sk_slice_count = 1;
+    params.sk_slice_idx = 0;
+    params.mul_topk_weights = mul_topk_weights;
+    params.use_fp32_reduce = use_fp32_reduce;
+    params.use_tma_load = true;
+
+    int smem_size = marlin_sm90_tma_wgmma::required_shared_memory_bytes(moe_block_size, b_type.size_bits());
+    int max_parallel = prob_m * top_k / moe_block_size;
+    int total_tiles = marlin_sm90_tma_wgmma::logical_mn_tiles(max_parallel, prob_n);
+    
+    if (b_type.size_bits() == 4) {
+      if (moe_block_size == 16) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else if (moe_block_size == 32) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else if (moe_block_size == 64) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 4, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else {
+        TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
+      }
+    } else if (b_type.size_bits() == 8) {
+      if (moe_block_size == 16) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else if (moe_block_size == 32) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else if (moe_block_size == 64) {
+        auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 8, 3>;
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+      } else {
+        TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
+      }
+    } else {
+      TORCH_CHECK(false, "Unsupported b_bits for TMA/WGMMA: ", b_type.size_bits());
+    }
+
+    cudaFreeAsync(tma_map_dev, stream);
+    return;
   }
 
   // Default pipeline depth: 2 on Turing, 4 on Ampere/Ada, 5 on Hopper.
@@ -770,7 +862,7 @@ torch::Tensor moe_wna16_marlin_gemm(
     vllm::ScalarTypeId const& b_type_id, int64_t size_m, int64_t size_n,
     int64_t size_k, bool is_k_full, bool use_atomic_add, bool use_fp32_reduce,
     bool is_zp_float, int64_t thread_k, int64_t thread_n,
-    int64_t blocks_per_sm) {
+    int64_t blocks_per_sm, bool use_tma) {
   vllm::ScalarTypeId a_type_id, c_type_id, s_type_id;
 
   auto c_dtype = a.dtype();
@@ -1112,7 +1204,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, parallel_moe_blocks);
+      is_zp_float, parallel_moe_blocks, use_tma);
 
   return c;
 }

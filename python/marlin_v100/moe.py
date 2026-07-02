@@ -50,6 +50,7 @@ def fused_marlin_moe(
     w1_zeros: torch.Tensor | None = None,
     w2_zeros: torch.Tensor | None = None,
     is_k_full: bool = True,
+    use_tma: bool = False,
 ) -> torch.Tensor:
     m, k = hidden_states.shape
     topk = topk_ids.shape[1]
@@ -107,6 +108,7 @@ def fused_marlin_moe(
         -1,
         -1,
         -1,
+        use_tma,
     )
     gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
@@ -143,5 +145,6 @@ def fused_marlin_moe(
         -1,
         -1,
         -1,
+        use_tma,
     )
     return output.view(m, topk, output_size).sum(dim=1)
