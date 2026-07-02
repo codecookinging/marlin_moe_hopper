@@ -29,6 +29,11 @@
 
 namespace marlin_sm90_tma_wgmma {
 
+// WGMMA/TMA bulk PTX is only legal on sm_90a (.target sm_90a), not base sm_90.
+#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
+#define MARLIN_SM90A_DEVICE 1
+#endif
+
 #if defined(__CUDACC__)
 #define MARLIN_SM90_HD __host__ __device__ __forceinline__
 #else
@@ -222,7 +227,7 @@ inline TensorMapBuildArgs make_b_tensor_map_build_args(
   };
 }
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if defined(MARLIN_SM90A_DEVICE)
 
 // ---------------------------------------------------------------------------
 // SM90 primitives
@@ -661,7 +666,7 @@ template <int moe_block_size, int b_bits, int stages = 3>
 __global__ void __launch_bounds__(128, 1)
     MarlinSm90TmaWgmmaKernel(Params params) {}
 
-#endif  // __CUDA_ARCH__ >= 900
+#endif  // MARLIN_SM90A_DEVICE
 
 #undef MARLIN_SM90_HD
 
