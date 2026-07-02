@@ -552,12 +552,12 @@ __device__ void store_tile(const Params& params, const TileWork& work,
     if (params.sk_slice_count > 1) {
       int tmp_tile = work.lock_offset * 64 * 128;
       float* tmp = C_tmp + tmp_tile + row * 128 + col;
-      if (work.sk_slice_idx == 0) {
+      if (params.sk_slice_idx == 0) {
         *tmp = value;
       } else {
         atomicAdd(tmp, value);
       }
-      if (work.sk_slice_idx == params.sk_slice_count - 1) {
+      if (params.sk_slice_idx == params.sk_slice_count - 1) {
         C_half[out_idx] = __float2half_rn(*tmp);
       }
     } else {
@@ -609,7 +609,7 @@ __device__ void run_dataflow(const Params& params, TileWork work, void* smem) {
           "wait_loop:\n"
           "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
           "  @!p bra wait_loop;\n"
-          "}\n" ::"r"(smem_bar), "n"(phase));
+          "}\n" ::"r"(smem_bar), "r"(phase));
     }
     __syncthreads(); // Ensure manual copies (A gather and fallback B) are done
 
