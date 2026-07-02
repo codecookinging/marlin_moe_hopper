@@ -655,6 +655,12 @@ __global__ void __launch_bounds__(128, 1)
   run_dataflow<moe_block_size, b_bits, stages>(params, work, smem);
 }
 
+#else
+
+template <int moe_block_size, int b_bits, int stages = 3>
+__global__ void __launch_bounds__(128, 1)
+    MarlinSm90TmaWgmmaKernel(Params params) {}
+
 #endif  // __CUDA_ARCH__ >= 900
 
 #undef MARLIN_SM90_HD
