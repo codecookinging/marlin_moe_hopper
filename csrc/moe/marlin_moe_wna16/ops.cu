@@ -639,6 +639,22 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     cudaMallocAsync(&tma_map_dev, sizeof(CUtensorMap), stream);
     cudaMemcpyAsync(tma_map_dev, &tma_map_host, sizeof(CUtensorMap), cudaMemcpyHostToDevice, stream);
 
+    // Dimension 3: TMA Multicast (Conceptual Setup)
+    // If we wanted to launch with Cluster Multicast, we would set up the launch attribute:
+    // cudaLaunchConfig_t config = {0};
+    // config.gridDim = dim3(total_tiles);
+    // config.blockDim = dim3(128);
+    // config.dynamicSmemBytes = smem_size;
+    // config.stream = stream;
+    // cudaLaunchAttribute attribute[1];
+    // attribute[0].id = cudaLaunchAttributeClusterDimension;
+    // attribute[0].val.clusterDim.x = 2; // Cluster size 2
+    // attribute[0].val.clusterDim.y = 1;
+    // attribute[0].val.clusterDim.z = 1;
+    // config.attrs = attribute;
+    // config.numAttrs = 1;
+    // cudaLaunchKernelEx(&config, kernel, params);
+
     marlin_sm90_tma_wgmma::Params params;
     params.A = reinterpret_cast<const int4*>(A);
     params.B = reinterpret_cast<const int4*>(B);
