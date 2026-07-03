@@ -688,15 +688,15 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       if (moe_block_size == 16) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 4, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else if (moe_block_size == 32) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 4, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else if (moe_block_size == 64) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 4, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else {
         TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
       }
@@ -704,15 +704,15 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       if (moe_block_size == 16) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<16, 8, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else if (moe_block_size == 32) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<32, 8, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else if (moe_block_size == 64) {
         auto kernel = marlin_sm90_tma_wgmma::MarlinSm90TmaWgmmaKernel<64, 8, 3>;
         cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-        kernel<<<total_tiles, 128, smem_size, stream>>>(params);
+        kernel<<<total_tiles, 256, smem_size, stream>>>(params);
       } else {
         TORCH_CHECK(false, "Unsupported moe_block_size for TMA/WGMMA: ", moe_block_size);
       }

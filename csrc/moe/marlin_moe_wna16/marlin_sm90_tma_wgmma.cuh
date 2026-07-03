@@ -386,8 +386,8 @@ __device__ TileWork map_cta_to_tile(const Params& params, int logical_tile,
 // ---------------------------------------------------------------------------
 
 template <int moe_block_size>
-__device__ void gather_a_stage(const Params& params, const TileWork& work,
-                               int k_stage_idx, half* sh_a) {
+__device__ void gather_a_stage_async(const Params& params, const TileWork& work,
+                                     int k_stage_idx, half* sh_a) {
   const int32_t* sorted =
       params.sorted_token_ids + work.par_id * moe_block_size;
   const int k_base = k_stage_idx * 64;
@@ -396,18 +396,23 @@ __device__ void gather_a_stage(const Params& params, const TileWork& work,
   for (int i = threadIdx.x; i < total_int4s; i += blockDim.x) {
     int row = i / 8;
     int col_chunk = i % 8;
-    int4 val = {0, 0, 0, 0};
+    int swizzled_col_chunk = col_chunk ^ (row & 7);
+    int swizzled_i = row * 8 + swizzled_col_chunk;
+    
+    uint32_t smem_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&reinterpret_cast<int4*>(sh_a)[swizzled_i]));
+    
     if (row < work.valid_m) {
       int64_t token = sorted[row] / params.top_k;
       const int4* a_int4 = reinterpret_cast<const int4*>(params.A);
-      val = a_int4[token * (params.prob_k / 8) + (k_base / 8) + col_chunk];
+      const void* src_ptr = &a_int4[token * (params.prob_k / 8) + (k_base / 8) + col_chunk];
+      
+      // 16-byte async copy for A matrix
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n"
+                   :: "r"(smem_ptr), "l"(src_ptr));
+    } else {
+      // Zero fill out-of-bounds
+      reinterpret_cast<int4*>(sh_a)[swizzled_i] = {0, 0, 0, 0};
     }
-    // 128B Swizzle: XOR row bits [0,2] into col bits [4,6] (which is int4 index bits [0,2])
-    // A row is 128 bytes. col_chunk is 0..7 (each is 16 bytes, total 128 bytes).
-    // Swizzle XORs (row & 7) into col_chunk.
-    int swizzled_col_chunk = col_chunk ^ (row & 7);
-    int swizzled_i = row * 8 + swizzled_col_chunk;
-    reinterpret_cast<int4*>(sh_a)[swizzled_i] = val;
   }
 }
 
@@ -688,76 +693,116 @@ __device__ void store_tile(const Params& params, const TileWork& work,
 }
 
 template <int moe_block_size, int b_bits, int stages = 3>
-__device__ void run_dataflow(const Params& params, TileWork work, void* smem) {
+__device__ void run_dataflow_warp_specialized(const Params& params, TileWork work, void* smem) {
   SharedStorageView<stages, b_bits> sh(smem);
   float accum[64] = {};
 
-  for (int i = threadIdx.x; i < stages; i += blockDim.x) {
-    mbarrier_init(&sh.barriers[i], 1); // Only thread 0 arrives for TMA
-  }
-  __syncthreads();
+  int wg_idx = threadIdx.x / 128; // 0 for Producer, 1 for Consumer
+  int lane_idx = threadIdx.x % 128;
 
-  // Prologue
-  for (int pipe = 0; pipe < stages - 1; pipe++) {
-    int k_stage = work.k_stage_begin + pipe;
-    if (k_stage < work.k_stage_end) {
-      gather_a_stage<moe_block_size>(params, work, k_stage, sh.a_stage(pipe));
-      copy_b_packed_stage<b_bits>(params, work, pipe, k_stage,
-                                  sh.b_packed_stage(pipe), sh.barriers);
+  // Initialize barriers. Producer uses these to wait for Consumer to finish using SMEM.
+  // Consumer uses TMA barriers to wait for Producer to finish fetching.
+  __shared__ uint64_t empty_barriers[stages];
+  __shared__ uint64_t full_barriers[stages]; // Used to signal dequantization is done
+
+  if (threadIdx.x == 0) {
+    for (int i = 0; i < stages; i++) {
+      mbarrier_init(&sh.barriers[i], 1); // TMA barrier (1 TX thread)
+      mbarrier_init(&empty_barriers[i], 128); // Consumer signals Producer (128 threads)
+      mbarrier_init(&full_barriers[i], 128); // Producer signals Consumer (128 threads)
     }
   }
   __syncthreads();
 
-  for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end; k_stage++) {
-    int pipe = (k_stage - work.k_stage_begin) % stages;
-    int next_k_stage = k_stage + stages - 1;
-    int next_pipe = next_k_stage % stages;
-
-    // Issue next fetch
-    if (next_k_stage < work.k_stage_end) {
-      gather_a_stage<moe_block_size>(params, work, next_k_stage, sh.a_stage(next_pipe));
-      copy_b_packed_stage<b_bits>(params, work, next_pipe, next_k_stage,
-                                  sh.b_packed_stage(next_pipe), sh.barriers);
-    }
-
-    // Wait for current fetch
-    if (params.use_tma_load && params.B_tma_map != nullptr) {
-      uint32_t smem_bar = static_cast<uint32_t>(__cvta_generic_to_shared(&sh.barriers[pipe]));
+  if (wg_idx == 0) {
+    // ========================================================================
+    // PRODUCER WARPGROUP (Threads 0-127)
+    // Responsible for A Gather (cp.async), B TMA Load, and B Dequantization
+    // ========================================================================
+    for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end; k_stage++) {
+      int pipe = (k_stage - work.k_stage_begin) % stages;
       int phase = ((k_stage - work.k_stage_begin) / stages) & 1;
+
+      // Wait for Consumer to finish with this pipeline stage's SMEM
+      if (k_stage - work.k_stage_begin >= stages) {
+        uint32_t empty_bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[pipe]));
+        asm volatile(
+            "{\n"
+            "  .reg .pred p;\n"
+            "wait_empty:\n"
+            "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+            "  @!p bra wait_empty;\n"
+            "}\n" ::"r"(empty_bar_smem), "r"(phase ^ 1));
+      }
+
+      // 1. Issue Async A Gather
+      gather_a_stage_async<moe_block_size>(params, work, k_stage, sh.a_stage(pipe));
+      asm volatile("cp.async.commit_group;\n");
+
+      // 2. Issue TMA B Load
+      copy_b_packed_stage<b_bits>(params, work, pipe, k_stage, sh.b_packed_stage(pipe), sh.barriers);
+
+      // 3. Wait for TMA B and Async A
+      if (params.use_tma_load && params.B_tma_map != nullptr) {
+        uint32_t smem_bar = static_cast<uint32_t>(__cvta_generic_to_shared(&sh.barriers[pipe]));
+        asm volatile(
+            "{\n"
+            "  .reg .pred p;\n"
+            "wait_tma:\n"
+            "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
+            "  @!p bra wait_tma;\n"
+            "}\n" ::"r"(smem_bar), "r"(phase));
+      }
+      asm volatile("cp.async.wait_all;\n");
+      __syncwarp(); // Ensure all producer threads see the loaded data
+
+      // 4. Dequantize B
+      dequant_b_stage_to_wgmma_shared<b_bits>(params, work, k_stage,
+                                              sh.b_packed_stage(pipe),
+                                              sh.b_dequant_stage(pipe));
+      __syncwarp(); // Ensure dequantization is complete
+
+      // 5. Signal Consumer that this stage is full and ready for WGMMA
+      uint32_t full_bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&full_barriers[pipe]));
+      asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" ::"r"(full_bar_smem));
+    }
+  } else {
+    // ========================================================================
+    // CONSUMER WARPGROUP (Threads 128-255)
+    // Responsible for WGMMA execution and Epilogue
+    // ========================================================================
+    for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end; k_stage++) {
+      int pipe = (k_stage - work.k_stage_begin) % stages;
+      int phase = ((k_stage - work.k_stage_begin) / stages) & 1;
+
+      // 1. Wait for Producer to finish Dequantizing B and loading A
+      uint32_t full_bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&full_barriers[pipe]));
       asm volatile(
           "{\n"
           "  .reg .pred p;\n"
-          "wait_loop:\n"
+          "wait_full:\n"
           "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
-          "  @!p bra wait_loop;\n"
-          "}\n" ::"r"(smem_bar), "r"(phase));
+          "  @!p bra wait_full;\n"
+          "}\n" ::"r"(full_bar_smem), "r"(phase));
+
+      // 2. Issue WGMMA
+      wgmma_fence();
+      warpgroup_mma_accumulate<stages, b_bits>(sh, pipe, accum);
+      wgmma_commit_group();
+      wgmma_wait_group<0>(); // Wait for WGMMA to finish before releasing SMEM
+
+      // 3. Signal Producer that SMEM is empty
+      uint32_t empty_bar_smem = static_cast<uint32_t>(__cvta_generic_to_shared(&empty_barriers[pipe]));
+      asm volatile("mbarrier.arrive.shared.b64 _, [%0];\n" ::"r"(empty_bar_smem));
     }
-    __syncthreads(); // Ensure manual copies (A gather and fallback B) are done
 
-    // Dequantize B
-    dequant_b_stage_to_wgmma_shared<b_bits>(params, work, k_stage,
-                                            sh.b_packed_stage(pipe),
-                                            sh.b_dequant_stage(pipe));
-    __syncthreads(); // Wait for dequant to finish
-
-    // Issue WGMMA
-    wgmma_fence();
-    warpgroup_mma_accumulate<stages, b_bits>(sh, pipe, accum);
-    wgmma_commit_group();
-
-    if constexpr (stages >= 3) {
-      wgmma_wait_group<stages - 2>();
-    } else {
-      wgmma_wait_group<0>();
-    }
+    // Epilogue (Only Consumer has the accumulators)
+    store_tile<moe_block_size>(params, work, accum);
   }
-
-  wgmma_wait_group<0>();
-  store_tile<moe_block_size>(params, work, accum);
 }
 
 template <int moe_block_size, int b_bits, int stages = 3>
-__global__ void __launch_bounds__(128, 1)
+__global__ void __launch_bounds__(256, 1)
     MarlinSm90TmaWgmmaKernel(Params params) {
   extern __shared__ __align__(16) unsigned char smem[];
 
@@ -773,7 +818,7 @@ __global__ void __launch_bounds__(128, 1)
   // for split-K shapes.
   TileWork work = map_cta_to_tile<moe_block_size>(
       params, logical_tile, 0, k_stages(params.prob_k), logical_tile);
-  run_dataflow<moe_block_size, b_bits, stages>(params, work, smem);
+  run_dataflow_warp_specialized<moe_block_size, b_bits, stages>(params, work, smem);
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +865,7 @@ __global__ void __launch_bounds__(128, 1)
 #else
 
 template <int moe_block_size, int b_bits, int stages = 3>
-__global__ void __launch_bounds__(128, 1)
+__global__ void __launch_bounds__(256, 1)
     MarlinSm90TmaWgmmaKernel(Params params) {}
 
 #endif  // MARLIN_SM90A_DEVICE
