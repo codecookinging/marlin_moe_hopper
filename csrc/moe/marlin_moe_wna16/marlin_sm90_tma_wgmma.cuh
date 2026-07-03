@@ -278,12 +278,14 @@ __device__ __forceinline__ void wgmma_wait_group() {
                : "memory");
 }
 
-__device__ __forceinline__ uint64_t make_smem_desc(const void* smem_ptr) {
-  // WGMMA shared descriptors are 64-bit descriptors.  This helper encodes the
-  // shared address; layout/stride bits are kept zero for the row-major prototype
-  // tile.  The production version should add swizzle/stride encoding here.
+__device__ __forceinline__ uint64_t make_smem_desc(const void* smem_ptr, int lbo, int sbo, int swizzle_mode) {
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  return static_cast<uint64_t>(smem);
+  uint64_t desc = 0;
+  desc |= (static_cast<uint64_t>(smem) >> 4) & 0x3FFF; // Base address (bits 0-13)
+  desc |= (static_cast<uint64_t>(lbo) & 0x3FFF) << 16; // Leading byte offset (bits 16-29)
+  desc |= (static_cast<uint64_t>(sbo) & 0x3FFF) << 32; // Stride byte offset (bits 32-45)
+  desc |= (static_cast<uint64_t>(swizzle_mode) & 0x3) << 62; // Swizzle mode (bits 62-63)
+  return desc;
 }
 
 __device__ __forceinline__ void tma_load_2d_b_tile(
@@ -388,7 +390,12 @@ __device__ void gather_a_stage(const Params& params, const TileWork& work,
       const int4* a_int4 = reinterpret_cast<const int4*>(params.A);
       val = a_int4[token * (params.prob_k / 8) + (k_base / 8) + col_chunk];
     }
-    reinterpret_cast<int4*>(sh_a)[i] = val;
+    // 128B Swizzle: XOR row bits [0,2] into col bits [4,6] (which is int4 index bits [0,2])
+    // A row is 128 bytes. col_chunk is 0..7 (each is 16 bytes, total 128 bytes).
+    // Swizzle XORs (row & 7) into col_chunk.
+    int swizzled_col_chunk = col_chunk ^ (row & 7);
+    int swizzled_i = row * 8 + swizzled_col_chunk;
+    reinterpret_cast<int4*>(sh_a)[swizzled_i] = val;
   }
 }
 
@@ -479,7 +486,22 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
       half scale = load_half_scale(params.scales, scale_idx);
       h_regs[j] = __float2half(centered * __half2float(scale));
     }
-    reinterpret_cast<int4*>(sh_b_dequant)[i] = *reinterpret_cast<int4*>(regs);
+    // 128B Swizzle: XOR row bits [0,2] into col bits [4,6] (which is int4 index bits [0,2])
+    // B is 64 rows (k) by 128 cols (n). A row is 256 bytes.
+    // Wait, 128B swizzle applies to 128-byte segments.
+    // For a 256-byte row, there are two 128-byte segments.
+    // The swizzle XORs (row & 7) into the 16-byte chunk index within the 128-byte segment.
+    // n_start is the column index in halfs (0..127). n_start / 8 is the 16-byte chunk index (0..15).
+    // The segment index is (n_start / 8) / 8 = (n_start / 64).
+    // The chunk index within segment is (n_start / 8) % 8.
+    // Swizzled chunk index within segment = ((n_start / 8) % 8) ^ (k & 7).
+    // Swizzled overall chunk index = (n_start / 64) * 8 + (((n_start / 8) % 8) ^ (k & 7)).
+    // Since i is the overall chunk index (i = k * 16 + n_start / 8),
+    // swizzled_i = k * 16 + (n_start / 64) * 8 + (((n_start / 8) % 8) ^ (k & 7)).
+    int chunk_idx = n_start / 8;
+    int swizzled_chunk_idx = (chunk_idx & ~7) | ((chunk_idx & 7) ^ (k & 7));
+    int swizzled_i = k * 16 + swizzled_chunk_idx;
+    reinterpret_cast<int4*>(sh_b_dequant)[swizzled_i] = *reinterpret_cast<int4*>(regs);
   }
 }
 
@@ -490,8 +512,18 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
 template <int stages, int b_bits>
 __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
                                          int stage, float* accum) {
-  uint64_t a_desc = make_smem_desc(sh.a_stage(stage));
-  uint64_t b_desc = make_smem_desc(sh.b_dequant_stage(stage));
+  // A is 64x64 half (row-major).
+  // 128B Swizzle (mode 1). For K-major (row-major A), LBO is not used (0).
+  // SBO is offset from first 8 rows to next 8 rows.
+  // 8 rows of 64 halfs = 8 * 128 bytes = 1024 bytes. 1024 / 16 = 64.
+  uint64_t a_desc = make_smem_desc(sh.a_stage(stage), 0, 64, 1);
+
+  // B is 64x128 half (row-major in shared memory).
+  // We use trans-b = 1 (B is row-major).
+  // For K-major (row-major B), LBO is not used (0).
+  // SBO is offset from first 8 rows to next 8 rows.
+  // 8 rows of 128 halfs = 8 * 256 bytes = 2048 bytes. 2048 / 16 = 128.
+  uint64_t b_desc = make_smem_desc(sh.b_dequant_stage(stage), 0, 128, 1);
 
   // One thread owns 64 accumulator registers for an m64n128 tile.  The four
   // k16 groups cover the k64 producer stage.
@@ -507,7 +539,7 @@ __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
         "%40,%41,%42,%43,%44,%45,%46,%47,"
         "%48,%49,%50,%51,%52,%53,%54,%55,"
         "%56,%57,%58,%59,%60,%61,%62,%63},"
-        " %64, %65, 1, 1, 1, 0, 0;\n"
+        " %64, %65, 1, 1, 1, 0, 1;\n"
         : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3]),
           "+f"(accum[4]), "+f"(accum[5]), "+f"(accum[6]), "+f"(accum[7]),
           "+f"(accum[8]), "+f"(accum[9]), "+f"(accum[10]), "+f"(accum[11]),
