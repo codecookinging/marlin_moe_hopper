@@ -170,3 +170,16 @@ git commit -m "Initialize marlin_v100 workspace"
 - `README.md`
 - `AGENTS.md`
 - `.gitignore`
+
+benchmark 测试方法：
+
+目前已有 256 1024 等shape
+
+PYTHONPATH=$PWD/python ./.venv/bin/python benchmark_marlin_moe_ab.py \
+  --mode single --model glm5 --timing batch \
+  --cases glm5_prefill_m256  glm5_prefill_m1024
+
+
+
+
+
