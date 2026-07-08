@@ -13,6 +13,7 @@ struct HostSupport {
 
 bool cutlass69_compiled();
 bool cutlass69_env_enabled();
+bool cutlass69_fused_gemm1_env_enabled();
 
 HostSupport select_host_path(int major_capability, int a_bits, int b_bits,
                              int prob_m, int prob_n, int prob_k,
@@ -27,5 +28,14 @@ void dispatch_marlin_moe_cutlass69(
     int prob_m, int prob_n, int prob_k, vllm::ScalarType const& a_type,
     vllm::ScalarType const& b_type, vllm::ScalarType const& c_type,
     int group_size, int dev, cudaStream_t stream);
+
+void dispatch_marlin_moe_cutlass69_fused_gemm1(
+    const void* A, const void* B, void* C, const void* b_scales,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const int32_t* num_tokens_past_padded, int moe_block_size, int num_experts,
+    int top_k, int prob_m, int prob_n, int prob_k,
+    vllm::ScalarType const& a_type, vllm::ScalarType const& b_type,
+    vllm::ScalarType const& c_type, int group_size, int dev,
+    cudaStream_t stream);
 
 }  // namespace marlin_moe_cutlass69_host

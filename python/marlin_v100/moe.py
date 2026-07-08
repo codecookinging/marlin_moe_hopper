@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 from . import ops
@@ -149,6 +151,14 @@ def fused_marlin_moe(
             props.multi_processor_count * max_blocks_per_sm,
             dtype=torch.int,
             device=hidden_states.device,
+        )
+
+    if os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1":
+        raise NotImplementedError(
+            "CUTLASS69 fused GEMM1 is intentionally not falling back to a "
+            "separate SiLU kernel. Wire example 69's mixed INT4 grouped "
+            "mainloop to example 113's gated SiLU epilogue first; GEMM1 must "
+            "write the activated [M*topk, N] tensor directly."
         )
 
     intermediate = torch.empty(

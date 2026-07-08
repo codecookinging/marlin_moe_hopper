@@ -13,7 +13,7 @@ message(STATUS "marlin_v100 build type: ${CMAKE_BUILD_TYPE}")
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/utils.cmake)
 
-set(PYTHON_SUPPORTED_VERSIONS "3.10" "3.11" "3.12" "3.13")
+set(PYTHON_SUPPORTED_VERSIONS "3.9" "3.10" "3.11" "3.12" "3.13")
 
 if (VLLM_PYTHON_EXECUTABLE)
   find_python_from_executable(${VLLM_PYTHON_EXECUTABLE} "${PYTHON_SUPPORTED_VERSIONS}")
@@ -24,16 +24,16 @@ endif()
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 find_package(Torch REQUIRED)
 
-if (NOT HIP_FOUND AND CUDA_FOUND)
+if (NOT HIP_FOUND)
   set(VLLM_GPU_LANG "CUDA")
 else()
   message(FATAL_ERROR "marlin_v100 currently supports CUDA-only builds.")
 endif()
 
-find_program(NVCC_EXECUTABLE nvcc)
-if (NOT NVCC_EXECUTABLE)
-  message(FATAL_ERROR "nvcc not found")
-endif()
+# find_program(NVCC_EXECUTABLE nvcc)
+# if (NOT NVCC_EXECUTABLE)
+#   message(FATAL_ERROR "nvcc not found")
+# endif()
 
 function(marlin_generate_kernels SCRIPT_PATH LOG_FILENAME FAILURE_MESSAGE)
   execute_process(

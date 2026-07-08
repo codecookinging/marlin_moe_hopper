@@ -20,6 +20,11 @@ bool cutlass69_env_enabled() {
   return env != nullptr && env[0] == '1';
 }
 
+bool cutlass69_fused_gemm1_env_enabled() {
+  const char* env = std::getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1");
+  return env != nullptr && env[0] == '1';
+}
+
 HostSupport select_host_path(int major_capability, int a_bits, int b_bits,
                              int prob_m, int prob_n, int prob_k,
                              bool has_act_order, bool has_zp, int moe_block_size,
@@ -94,6 +99,38 @@ void dispatch_marlin_moe_cutlass69(
               "CUTLASS. Set CUTLASS_DIR and rebuild.");
 }
 
+void dispatch_marlin_moe_cutlass69_fused_gemm1(
+    const void* A, const void* B, void* C, const void* b_scales,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const int32_t* num_tokens_past_padded, int moe_block_size, int num_experts,
+    int top_k, int prob_m, int prob_n, int prob_k,
+    vllm::ScalarType const& a_type, vllm::ScalarType const& b_type,
+    vllm::ScalarType const& c_type, int group_size, int dev,
+    cudaStream_t stream) {
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)b_scales;
+  (void)sorted_token_ids;
+  (void)expert_ids;
+  (void)num_tokens_past_padded;
+  (void)moe_block_size;
+  (void)num_experts;
+  (void)top_k;
+  (void)prob_m;
+  (void)prob_n;
+  (void)prob_k;
+  (void)a_type;
+  (void)b_type;
+  (void)c_type;
+  (void)group_size;
+  (void)dev;
+  (void)stream;
+  TORCH_CHECK(false,
+              "MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1=1 requires CUTLASS. "
+              "Set CUTLASS_DIR and rebuild.");
+}
+
 #else  // MARLIN_MOE_HAS_CUTLASS
 
 #include <cuda_fp16.h>
@@ -124,7 +161,7 @@ constexpr int kScaleChunk = 128;
 
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
 
-template <typename MmaType, typename ElementC>
+template <typename MmaType, typename ElementC_>
 struct Cutlass69GroupedGemmTypes {
   using ElementA = MmaType;
   using LayoutA = cutlass::layout::RowMajor;
@@ -159,6 +196,7 @@ struct Cutlass69GroupedGemmTypes {
   using ElementScale = MmaType;
   using LayoutScale = cutlass::layout::RowMajor;
 
+  using ElementC = ElementC_;
   using LayoutC = cutlass::layout::RowMajor;
   using ElementD = ElementC;
   using LayoutD = LayoutC;
@@ -180,10 +218,11 @@ struct Cutlass69GroupedGemmTypes {
 
   using CollectiveEpilogue =
       typename cutlass::epilogue::collective::CollectiveBuilder<
-          cutlass::arch::Sm90, cutlass::arch::OpClassTensorOp, TileShape,
-          ClusterShape, cutlass::epilogue::collective::EpilogueTileAuto,
-          ElementAccumulator, ElementAccumulator, ElementC,
-          typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC,
+          ArchTag, OperatorClass, TileShape, ClusterShape,
+          cutlass::epilogue::collective::EpilogueTileAuto,
+          ElementAccumulator, ElementAccumulator,
+          ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*,
+          AlignmentC,
           ElementD, typename cutlass::layout::LayoutTranspose<LayoutD>::type*,
           AlignmentD, EpilogueSchedule>::CollectiveOp;
 
@@ -197,13 +236,14 @@ struct Cutlass69GroupedGemmTypes {
               sizeof(typename CollectiveEpilogue::SharedStorage))>,
           KernelSchedule>::CollectiveOp;
 
-  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<ProblemShape,
-                                                          CollectiveMainloop,
-                                                          CollectiveEpilogue>;
+  using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
+      ProblemShape, CollectiveMainloop, CollectiveEpilogue,
+      cutlass::gemm::GroupSchedulerTileShapeDependent>;
+
   using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
   using StrideC = typename GemmKernel::InternalStrideC;
-  using StrideD = typename GemmKernel::InternalStrideD;
+  using StrideD = cute::remove_pointer_t<typename GemmKernel::CollectiveEpilogue::FusionCallbacks::Operation::GmemLayoutTagAux>;
   using StrideS = typename CollectiveMainloop::StrideScale;
 };
 
@@ -264,12 +304,15 @@ bool launch_grouped_gemm(
   std::vector<ElementA*> ptr_A_host(groups);
   std::vector<const typename GemmTypes::ElementB*> ptr_B_host(groups);
   std::vector<const ElementScale*> ptr_scale_host(groups);
+  std::vector<const ElementC*> ptr_C_host(groups);
   std::vector<ElementC*> ptr_D_host(groups);
   std::vector<StrideA> stride_A_host(groups);
   std::vector<StrideB> stride_B_host(groups);
+  std::vector<StrideC> stride_C_host(groups);
   std::vector<StrideD> stride_D_host(groups);
   std::vector<StrideS> stride_S_host(groups);
   std::vector<LayoutB_Reordered> layout_B_reordered_host(groups);
+  std::vector<int32_t> expert_ids_host(groups);
 
   const int64_t group_a_elems =
       static_cast<int64_t>(moe_block_size) * prob_k;
@@ -281,9 +324,11 @@ bool launch_grouped_gemm(
   cutlass::DeviceAllocation<ElementA*> ptr_A;
   cutlass::DeviceAllocation<const typename GemmTypes::ElementB*> ptr_B;
   cutlass::DeviceAllocation<const ElementScale*> ptr_scale;
+  cutlass::DeviceAllocation<const ElementC*> ptr_C;
   cutlass::DeviceAllocation<ElementC*> ptr_D;
   cutlass::DeviceAllocation<StrideA> stride_A;
   cutlass::DeviceAllocation<StrideB> stride_B;
+  cutlass::DeviceAllocation<StrideC> stride_C;
   cutlass::DeviceAllocation<StrideD> stride_D;
   cutlass::DeviceAllocation<StrideS> stride_S;
   cutlass::DeviceAllocation<LayoutB_Reordered> layout_B_reordered;
@@ -291,18 +336,25 @@ bool launch_grouped_gemm(
   cutlass::DeviceAllocation<typename GemmTypes::ElementB> b_staging;
   const int64_t b_elems_per_expert = static_cast<int64_t>(prob_k) * prob_n / 2;
   b_staging.reset(groups * b_elems_per_expert);
+  CUDA_CHECK(cudaMemcpyAsync(expert_ids_host.data(), expert_ids,
+                             groups * sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
 
   for (int g = 0; g < groups; ++g) {
-    const int expert = expert_ids[g];
+    const int expert = expert_ids_host[g];
     problem_sizes_host[g] = make_tuple(prob_n, moe_block_size, prob_k);
 
     ptr_A_host[g] = const_cast<ElementA*>(A_grouped) + g * group_a_elems;
+    ptr_C_host[g] = C_out + g * group_c_elems;
     ptr_D_host[g] = C_out + g * group_c_elems;
 
     stride_A_host[g] =
         cutlass::make_cute_packed_stride(StrideA{}, {moe_block_size, prob_k, 1});
     stride_B_host[g] =
         cutlass::make_cute_packed_stride(StrideB{}, {prob_n, prob_k, 1});
+    stride_C_host[g] =
+        cutlass::make_cute_packed_stride(StrideC{}, {prob_n, moe_block_size, 1});
     stride_D_host[g] =
         cutlass::make_cute_packed_stride(StrideD{}, {prob_n, moe_block_size, 1});
     stride_S_host[g] = cutlass::make_cute_packed_stride(
@@ -339,12 +391,16 @@ bool launch_grouped_gemm(
   ptr_B.copy_from_host(ptr_B_host.data());
   ptr_scale.reset(groups);
   ptr_scale.copy_from_host(ptr_scale_host.data());
+  ptr_C.reset(groups);
+  ptr_C.copy_from_host(ptr_C_host.data());
   ptr_D.reset(groups);
   ptr_D.copy_from_host(ptr_D_host.data());
   stride_A.reset(groups);
   stride_A.copy_from_host(stride_A_host.data());
   stride_B.reset(groups);
   stride_B.copy_from_host(stride_B_host.data());
+  stride_C.reset(groups);
+  stride_C.copy_from_host(stride_C_host.data());
   stride_D.reset(groups);
   stride_D.copy_from_host(stride_D_host.data());
   stride_S.reset(groups);
@@ -373,7 +429,7 @@ bool launch_grouped_gemm(
       {groups, problem_sizes.get(), nullptr},
       {ptr_B.get(), layout_B_reordered.get(), ptr_A.get(), stride_A.get(),
        ptr_scale.get(), stride_S.get(), kScaleChunk},
-      {fusion_args, nullptr, nullptr, ptr_D.get(), stride_D.get()},
+      {fusion_args, ptr_C.get(), stride_C.get(), ptr_D.get(), stride_D.get()},
       hw_info};
 
   Gemm gemm;
@@ -405,7 +461,12 @@ void dispatch_marlin_moe_cutlass69(
   TORCH_CHECK(false,
               "CUTLASS example-69 kernels require sm_90a compilation.");
 #else
-  const int groups = num_tokens_past_padded[0] / moe_block_size;
+  int32_t num_tokens_past_padded_host = 0;
+  CUDA_CHECK(cudaMemcpyAsync(&num_tokens_past_padded_host,
+                             num_tokens_past_padded, sizeof(int32_t),
+                             cudaMemcpyDeviceToHost, stream));
+  CUDA_CHECK(cudaStreamSynchronize(stream));
+  const int groups = num_tokens_past_padded_host / moe_block_size;
   TORCH_CHECK(groups > 0, "CUTLASS69 requires at least one MoE block.");
 
   const int scale_k = cutlass::ceil_div(prob_k, kScaleChunk);
@@ -442,7 +503,7 @@ void dispatch_marlin_moe_cutlass69(
 
   if (c_type == vllm::kBFloat16) {
     using MmaType = cutlass::bfloat16_t;
-    using ElementC = cutlass::half_t;
+    using ElementC = cutlass::bfloat16_t;
     using GemmTypes = Cutlass69GroupedGemmTypes<MmaType, ElementC>;
     const size_t expert_scale_bytes =
         static_cast<size_t>(prob_n) * scale_k * sizeof(MmaType);
@@ -471,6 +532,41 @@ void dispatch_marlin_moe_cutlass69(
 
   TORCH_CHECK(false, "Unsupported activation dtype for CUTLASS69 path.");
 #endif
+}
+
+void dispatch_marlin_moe_cutlass69_fused_gemm1(
+    const void* A, const void* B, void* C, const void* b_scales,
+    const int32_t* sorted_token_ids, const int32_t* expert_ids,
+    const int32_t* num_tokens_past_padded, int moe_block_size, int num_experts,
+    int top_k, int prob_m, int prob_n, int prob_k,
+    vllm::ScalarType const& a_type, vllm::ScalarType const& b_type,
+    vllm::ScalarType const& c_type, int group_size, int dev,
+    cudaStream_t stream) {
+  (void)A;
+  (void)B;
+  (void)C;
+  (void)b_scales;
+  (void)sorted_token_ids;
+  (void)expert_ids;
+  (void)num_tokens_past_padded;
+  (void)moe_block_size;
+  (void)num_experts;
+  (void)top_k;
+  (void)prob_m;
+  (void)prob_n;
+  (void)prob_k;
+  (void)a_type;
+  (void)b_type;
+  (void)c_type;
+  (void)group_size;
+  (void)dev;
+  (void)stream;
+  TORCH_CHECK(false,
+              "CUTLASS69 fused GEMM1 is not wired yet. The required design is "
+              "example69 mixed INT4 grouped mainloop + example113 gated SiLU "
+              "epilogue, with problem shape [(M,2),N,K] and D width N. Do not "
+              "fallback to a separate SiLU kernel when "
+              "MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1=1.");
 }
 
 #endif  // MARLIN_MOE_HAS_CUTLASS
