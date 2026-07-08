@@ -29,14 +29,11 @@
 
 namespace marlin_sm90_tma_wgmma {
 
-<<<<<<< HEAD
-=======
 // WGMMA/TMA bulk PTX is only legal on sm_90a (.target sm_90a), not base sm_90.
 #if defined(__CUDA_ARCH_FEAT_SM90_ALL)
 #define MARLIN_SM90A_DEVICE 1
 #endif
 
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 #if defined(__CUDACC__)
 #define MARLIN_SM90_HD __host__ __device__ __forceinline__
 #else
@@ -230,11 +227,7 @@ inline TensorMapBuildArgs make_b_tensor_map_build_args(
   };
 }
 
-<<<<<<< HEAD
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-=======
 #if defined(MARLIN_SM90A_DEVICE)
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
 // ---------------------------------------------------------------------------
 // SM90 primitives
@@ -285,14 +278,6 @@ __device__ __forceinline__ void wgmma_wait_group() {
                : "memory");
 }
 
-<<<<<<< HEAD
-__device__ __forceinline__ uint64_t make_smem_desc(const void* smem_ptr) {
-  // WGMMA shared descriptors are 64-bit descriptors.  This helper encodes the
-  // shared address; layout/stride bits are kept zero for the row-major prototype
-  // tile.  The production version should add swizzle/stride encoding here.
-  uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  return static_cast<uint64_t>(smem);
-=======
 __device__ __forceinline__ uint64_t make_smem_desc(const void* smem_ptr, int lbo, int sbo, int swizzle_mode) {
   uint32_t smem = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
   uint64_t desc = 0;
@@ -301,7 +286,6 @@ __device__ __forceinline__ uint64_t make_smem_desc(const void* smem_ptr, int lbo
   desc |= (static_cast<uint64_t>(sbo) & 0x3FFF) << 32; // Stride byte offset (bits 32-45)
   desc |= (static_cast<uint64_t>(swizzle_mode) & 0x3) << 62; // Swizzle mode (bits 62-63)
   return desc;
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 }
 
 __device__ __forceinline__ void tma_load_2d_b_tile(
@@ -316,8 +300,6 @@ __device__ __forceinline__ void tma_load_2d_b_tile(
       : "memory");
 }
 
-<<<<<<< HEAD
-=======
 __device__ __forceinline__ void tma_load_2d_b_tile_multicast(
     void* dst_smem, const void* tensor_map, int packed_col, int packed_row,
     uint64_t* barrier, uint16_t mcast_mask) {
@@ -330,7 +312,6 @@ __device__ __forceinline__ void tma_load_2d_b_tile_multicast(
       : "memory");
 }
 
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 // ---------------------------------------------------------------------------
 // Shared-memory tile views
 // ---------------------------------------------------------------------------
@@ -405,13 +386,8 @@ __device__ TileWork map_cta_to_tile(const Params& params, int logical_tile,
 // ---------------------------------------------------------------------------
 
 template <int moe_block_size>
-<<<<<<< HEAD
-__device__ void gather_a_stage(const Params& params, const TileWork& work,
-                               int k_stage_idx, half* sh_a) {
-=======
 __device__ void gather_a_stage_async(const Params& params, const TileWork& work,
                                      int k_stage_idx, half* sh_a) {
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   const int32_t* sorted =
       params.sorted_token_ids + work.par_id * moe_block_size;
   const int k_base = k_stage_idx * 64;
@@ -420,15 +396,6 @@ __device__ void gather_a_stage_async(const Params& params, const TileWork& work,
   for (int i = threadIdx.x; i < total_int4s; i += blockDim.x) {
     int row = i / 8;
     int col_chunk = i % 8;
-<<<<<<< HEAD
-    int4 val = {0, 0, 0, 0};
-    if (row < work.valid_m) {
-      int64_t token = sorted[row] / params.top_k;
-      const int4* a_int4 = reinterpret_cast<const int4*>(params.A);
-      val = a_int4[token * (params.prob_k / 8) + (k_base / 8) + col_chunk];
-    }
-    reinterpret_cast<int4*>(sh_a)[i] = val;
-=======
     int swizzled_col_chunk = col_chunk ^ (row & 7);
     int swizzled_i = row * 8 + swizzled_col_chunk;
     
@@ -446,7 +413,6 @@ __device__ void gather_a_stage_async(const Params& params, const TileWork& work,
       // Zero fill out-of-bounds
       reinterpret_cast<int4*>(sh_a)[swizzled_i] = {0, 0, 0, 0};
     }
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   }
 }
 
@@ -537,9 +503,6 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
       half scale = load_half_scale(params.scales, scale_idx);
       h_regs[j] = __float2half(centered * __half2float(scale));
     }
-<<<<<<< HEAD
-    reinterpret_cast<int4*>(sh_b_dequant)[i] = *reinterpret_cast<int4*>(regs);
-=======
     // 128B Swizzle: XOR row bits [0,2] into col bits [4,6] (which is int4 index bits [0,2])
     // B is 64 rows (k) by 128 cols (n). A row is 256 bytes.
     // Wait, 128B swizzle applies to 128-byte segments.
@@ -556,7 +519,6 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
     int swizzled_chunk_idx = (chunk_idx & ~7) | ((chunk_idx & 7) ^ (k & 7));
     int swizzled_i = k * 16 + swizzled_chunk_idx;
     reinterpret_cast<int4*>(sh_b_dequant)[swizzled_i] = *reinterpret_cast<int4*>(regs);
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   }
 }
 
@@ -567,10 +529,6 @@ __device__ void dequant_b_stage_to_wgmma_shared(const Params& params,
 template <int stages, int b_bits>
 __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
                                          int stage, float* accum) {
-<<<<<<< HEAD
-  uint64_t a_desc = make_smem_desc(sh.a_stage(stage));
-  uint64_t b_desc = make_smem_desc(sh.b_dequant_stage(stage));
-=======
   // A is 64x64 half (row-major).
   // 128B Swizzle (mode 1). For K-major (row-major A), LBO is not used (0).
   // SBO is offset from first 8 rows to next 8 rows.
@@ -583,7 +541,6 @@ __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
   // SBO is offset from first 8 rows to next 8 rows.
   // 8 rows of 128 halfs = 8 * 256 bytes = 2048 bytes. 2048 / 16 = 128.
   uint64_t b_desc = make_smem_desc(sh.b_dequant_stage(stage), 0, 128, 1);
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
   // One thread owns 64 accumulator registers for an m64n128 tile.  The four
   // k16 groups cover the k64 producer stage.
@@ -599,11 +556,7 @@ __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
         "%40,%41,%42,%43,%44,%45,%46,%47,"
         "%48,%49,%50,%51,%52,%53,%54,%55,"
         "%56,%57,%58,%59,%60,%61,%62,%63},"
-<<<<<<< HEAD
-        " %64, %65, 1, 1, 1, 0, 0;\n"
-=======
         " %64, %65, 1, 1, 1, 0, 1;\n"
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
         : "+f"(accum[0]), "+f"(accum[1]), "+f"(accum[2]), "+f"(accum[3]),
           "+f"(accum[4]), "+f"(accum[5]), "+f"(accum[6]), "+f"(accum[7]),
           "+f"(accum[8]), "+f"(accum[9]), "+f"(accum[10]), "+f"(accum[11]),
@@ -625,8 +578,6 @@ __device__ void warpgroup_mma_accumulate(SharedStorageView<stages, b_bits>& sh,
   }
 }
 
-<<<<<<< HEAD
-=======
 // ---------------------------------------------------------------------------
 // Dimension 1: Register-Sourced A for WGMMA
 // ---------------------------------------------------------------------------
@@ -699,7 +650,6 @@ __device__ void warpgroup_mma_accumulate_int4(uint64_t a_desc, uint64_t b_desc, 
   }
 }
 
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 template <int moe_block_size>
 __device__ void store_tile(const Params& params, const TileWork& work,
                            const float* accum) {
@@ -728,20 +678,12 @@ __device__ void store_tile(const Params& params, const TileWork& work,
     if (params.sk_slice_count > 1) {
       int tmp_tile = work.lock_offset * 64 * 128;
       float* tmp = C_tmp + tmp_tile + row * 128 + col;
-<<<<<<< HEAD
-      if (work.sk_slice_idx == 0) {
-=======
       if (params.sk_slice_idx == 0) {
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
         *tmp = value;
       } else {
         atomicAdd(tmp, value);
       }
-<<<<<<< HEAD
-      if (work.sk_slice_idx == params.sk_slice_count - 1) {
-=======
       if (params.sk_slice_idx == params.sk_slice_count - 1) {
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
         C_half[out_idx] = __float2half_rn(*tmp);
       }
     } else {
@@ -751,24 +693,6 @@ __device__ void store_tile(const Params& params, const TileWork& work,
 }
 
 template <int moe_block_size, int b_bits, int stages = 3>
-<<<<<<< HEAD
-__device__ void run_dataflow(const Params& params, TileWork work, void* smem) {
-  SharedStorageView<stages, b_bits> sh(smem);
-  float accum[64] = {};
-
-  for (int i = threadIdx.x; i < stages; i += blockDim.x) {
-    mbarrier_init(&sh.barriers[i], 1); // Only thread 0 arrives for TMA
-  }
-  __syncthreads();
-
-  // Prologue
-  for (int pipe = 0; pipe < stages - 1; pipe++) {
-    int k_stage = work.k_stage_begin + pipe;
-    if (k_stage < work.k_stage_end) {
-      gather_a_stage<moe_block_size>(params, work, k_stage, sh.a_stage(pipe));
-      copy_b_packed_stage<b_bits>(params, work, pipe, k_stage,
-                                  sh.b_packed_stage(pipe), sh.barriers);
-=======
 __device__ void run_dataflow_warp_specialized(const Params& params, TileWork work, void* smem) {
   SharedStorageView<stages, b_bits> sh(smem);
   float accum[64] = {};
@@ -786,63 +710,10 @@ __device__ void run_dataflow_warp_specialized(const Params& params, TileWork wor
       mbarrier_init(&sh.barriers[i], 1); // TMA barrier (1 TX thread)
       mbarrier_init(&empty_barriers[i], 128); // Consumer signals Producer (128 threads)
       mbarrier_init(&full_barriers[i], 128); // Producer signals Consumer (128 threads)
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
     }
   }
   __syncthreads();
 
-<<<<<<< HEAD
-  for (int k_stage = work.k_stage_begin; k_stage < work.k_stage_end; k_stage++) {
-    int pipe = (k_stage - work.k_stage_begin) % stages;
-    int next_k_stage = k_stage + stages - 1;
-    int next_pipe = next_k_stage % stages;
-
-    // Issue next fetch
-    if (next_k_stage < work.k_stage_end) {
-      gather_a_stage<moe_block_size>(params, work, next_k_stage, sh.a_stage(next_pipe));
-      copy_b_packed_stage<b_bits>(params, work, next_pipe, next_k_stage,
-                                  sh.b_packed_stage(next_pipe), sh.barriers);
-    }
-
-    // Wait for current fetch
-    if (params.use_tma_load && params.B_tma_map != nullptr) {
-      uint32_t smem_bar = static_cast<uint32_t>(__cvta_generic_to_shared(&sh.barriers[pipe]));
-      int phase = ((k_stage - work.k_stage_begin) / stages) & 1;
-      asm volatile(
-          "{\n"
-          "  .reg .pred p;\n"
-          "wait_loop:\n"
-          "  mbarrier.try_wait.parity.shared.b64 p, [%0], %1;\n"
-          "  @!p bra wait_loop;\n"
-          "}\n" ::"r"(smem_bar), "n"(phase));
-    }
-    __syncthreads(); // Ensure manual copies (A gather and fallback B) are done
-
-    // Dequantize B
-    dequant_b_stage_to_wgmma_shared<b_bits>(params, work, k_stage,
-                                            sh.b_packed_stage(pipe),
-                                            sh.b_dequant_stage(pipe));
-    __syncthreads(); // Wait for dequant to finish
-
-    // Issue WGMMA
-    wgmma_fence();
-    warpgroup_mma_accumulate<stages, b_bits>(sh, pipe, accum);
-    wgmma_commit_group();
-
-    if constexpr (stages >= 3) {
-      wgmma_wait_group<stages - 2>();
-    } else {
-      wgmma_wait_group<0>();
-    }
-  }
-
-  wgmma_wait_group<0>();
-  store_tile<moe_block_size>(params, work, accum);
-}
-
-template <int moe_block_size, int b_bits, int stages = 3>
-__global__ void __launch_bounds__(128, 1)
-=======
   if (wg_idx == 0) {
     // ========================================================================
     // PRODUCER WARPGROUP (Threads 0-127)
@@ -932,7 +803,6 @@ __global__ void __launch_bounds__(128, 1)
 
 template <int moe_block_size, int b_bits, int stages = 3>
 __global__ void __launch_bounds__(256, 1)
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
     MarlinSm90TmaWgmmaKernel(Params params) {
   extern __shared__ __align__(16) unsigned char smem[];
 
@@ -948,12 +818,6 @@ __global__ void __launch_bounds__(256, 1)
   // for split-K shapes.
   TileWork work = map_cta_to_tile<moe_block_size>(
       params, logical_tile, 0, k_stages(params.prob_k), logical_tile);
-<<<<<<< HEAD
-  run_dataflow<moe_block_size, b_bits, stages>(params, work, smem);
-}
-
-#endif  // __CUDA_ARCH__ >= 900
-=======
   run_dataflow_warp_specialized<moe_block_size, b_bits, stages>(params, work, smem);
 }
 
@@ -1005,7 +869,6 @@ __global__ void __launch_bounds__(256, 1)
     MarlinSm90TmaWgmmaKernel(Params params) {}
 
 #endif  // MARLIN_SM90A_DEVICE
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
 #undef MARLIN_SM90_HD
 

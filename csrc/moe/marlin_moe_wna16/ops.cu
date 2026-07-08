@@ -1,10 +1,5 @@
-<<<<<<< HEAD
-#include <cstdlib>
-#include <cstdio>
-=======
 #include <cmath>
 #include <cstdlib>
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
@@ -31,11 +26,8 @@
 #endif
 
 #include "kernel.h"
-<<<<<<< HEAD
-=======
 #include "marlin_sm90_tma_wgmma.cuh"
 #include "quantization/marlin/marlin_streamk_schedule.h"
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 #include "core/registration.h"
 
 
@@ -431,11 +423,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-<<<<<<< HEAD
-               bool use_fp32_reduce, bool is_zp_float) {
-=======
                bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks, bool use_tma) {
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -527,8 +515,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
-<<<<<<< HEAD
-=======
 
   const char* use_tma_wgmma_env = std::getenv("MARLIN_MOE_USE_TMA_WGMMA");
   if (use_tma_wgmma_env != nullptr && use_tma_wgmma_env[0] == '1') {
@@ -673,7 +659,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   // The autotuning below will fall back to stages=4 if a stages=5 config is
   // not found (e.g. because the combination of thread_n / thread_k is such
   // that 5 stages still exceeds the smem budget for that tile).
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
   int stages = 4;
   if (major_capability == 7 && minor_capability == 5) {
     stages = 2;
@@ -729,21 +714,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
 
-<<<<<<< HEAD
-  printf(
-      "moe_block_size=%d thread_m_blocks=%d blocks_per_sm=%d sms=%d "
-      "num_threads=%d thread_k=%d thread_n=%d prob_m=%d\n",
-      moe_block_size, thread_m_blocks, exec_cfg.blocks_per_sm, sms, num_threads,
-      thread_k, thread_n, prob_m);
-
-  // Allow overriding the grid size for empirical benchmarking
-  const char* force_grid_env = std::getenv("MARLIN_MOE_FORCE_GRID");
-  if (force_grid_env) {
-      blocks = std::atoi(force_grid_env);
-  }
-  if (exec_cfg.blocks_per_sm > 1)
-    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
-=======
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
 
@@ -760,7 +730,6 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   int eff_blocks_per_sm = std::max(div_ceil(blocks, sms), 1);
   if (eff_blocks_per_sm > 1)
     max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
@@ -1142,11 +1111,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-<<<<<<< HEAD
-      is_zp_float);
-=======
       is_zp_float, parallel_moe_blocks, use_tma);
->>>>>>> 3214524 (Add SM90 TMA WGMMA dataflow scaffold.)
 
   return c;
 }
