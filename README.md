@@ -179,7 +179,8 @@ PYTHONPATH=$PWD/python ./.venv/bin/python benchmark_marlin_moe_ab.py \
   --mode single --model glm5 --timing batch \
   --cases glm5_prefill_m256  glm5_prefill_m1024
 
+编译特定架构
 
-
+export CMAKE_ARGS='-DCMAKE_CUDA_FLAGS=-gencode arch=compute_90a,code=sm_90a'
 
 

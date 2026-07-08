@@ -91,6 +91,27 @@ class MarlinScalarType<vllm::kBFloat16.id()> {
   static __host__ __device__ float2 inline num22float2(const nv_bfloat162 x) {
     return __bfloat1622float2(x);
   }
+#else
+  static __device__ float inline num2float(const nv_bfloat16) {
+    return 0.f;
+  }
+
+  static __device__ nv_bfloat162 inline num2num2(const nv_bfloat16) {
+    return {};
+  }
+
+  static __device__ nv_bfloat162 inline nums2num2(const nv_bfloat16,
+                                                  const nv_bfloat16) {
+    return {};
+  }
+
+  static __host__ __device__ nv_bfloat16 inline float2num(const float) {
+    return {};
+  }
+
+  static __host__ __device__ float2 inline num22float2(const nv_bfloat162) {
+    return {};
+  }
 #endif
 };
 
@@ -105,7 +126,31 @@ class MarlinScalarType<vllm::kFE4M3fn.id()> {
   using FragA = Vec<__nv_fp8x4_e4m3, 4>;
   using FragB = Vec<__nv_fp8x4_e4m3, 2>;
   using FragC = Vec<float, 4>;
+  using FragS = Vec<__nv_fp8x2_e4m3, 1>;
   using FragZP = Vec<__nv_fp8x2_e4m3, 4>;
+
+  static __device__ float inline num2float(const __nv_fp8_e4m3 x) {
+    return static_cast<float>(x);
+  }
+
+  static __device__ __nv_fp8x2_e4m3 inline num2num2(const __nv_fp8_e4m3 x) {
+    uint16_t u = static_cast<uint8_t>(reinterpret_cast<const uint8_t&>(x));
+    u |= (u << 8);
+    return *reinterpret_cast<const __nv_fp8x2_e4m3*>(&u);
+  }
+
+  static __device__ __nv_fp8x2_e4m3 inline nums2num2(const __nv_fp8_e4m3 x1,
+                                                     const __nv_fp8_e4m3 x2) {
+    uint16_t u = static_cast<uint8_t>(reinterpret_cast<const uint8_t&>(x1));
+    u |= static_cast<uint16_t>(
+             static_cast<uint8_t>(reinterpret_cast<const uint8_t&>(x2)))
+         << 8;
+    return *reinterpret_cast<const __nv_fp8x2_e4m3*>(&u);
+  }
+
+  static __host__ __device__ __nv_fp8_e4m3 inline float2num(const float x) {
+    return static_cast<__nv_fp8_e4m3>(x);
+  }
 
   static __host__ __device__
       float2 inline num22float2(const __nv_fp8x2_e4m3 x) {

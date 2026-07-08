@@ -31,77 +31,6 @@
 #include "quantization/marlin/marlin_streamk_schedule.h"
 #include "core/registration.h"
 
-
-namespace {
-
-static float runtime_units(int global_mn_tiles, int grid, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-  marlin_schedule::MarlinStreamKSchedule sk =
-      marlin_schedule::compute_marlin_streamk_schedule(
-          global_mn_tiles, k_tiles, grid, group_blocks, thread_k_blocks,
-          has_act_order);
-
-  int part1_iters = sk.part1_mn_iters;
-  int part2 = sk.part2_mn_tiles;
-  int slice_iters = sk.slice_iters;
-
-  bool sk_active = (part2 > 0) && (slice_iters < k_tiles);
-  int per_cta_iters = part1_iters * k_tiles + (part2 > 0 ? slice_iters : 0);
-
-  int resident = std::min(grid, sms * bmax);
-  int hw_waves = (grid + resident - 1) / resident;
-  float busy = per_cta_iters * hw_waves;
-
-  float idle_penalty = 0.0f;
-  if (grid < sms) {
-      idle_penalty = (float)(sms - grid) / sms * k_tiles * 0.5f;
-  }
-
-  float red_penalty = 0.0f;
-  if (sk_active) {
-      float splits_per_tile = (float)grid / std::max(1, part2);
-      red_penalty = 6.0f + 1.5f * splits_per_tile;
-  }
-
-  int bps = (std::min(grid, sms * bmax) + sms - 1) / sms;
-  float smem_factor = 1.0f + 0.04f * std::max(0, bps - 1);
-
-  int last_wave = grid - (hw_waves - 1) * resident;
-  float waveq_penalty = 0.0f;
-  if (last_wave < sms && hw_waves >= 1 && grid >= sms) {
-      waveq_penalty = (float)(sms - last_wave) / sms * per_cta_iters * 0.15f;
-  }
-
-  return busy * smem_factor + idle_penalty + red_penalty + waveq_penalty;
-}
-
-static int best_grid(int T, int k_tiles, int sms, int bmax, int group_blocks, int thread_k_blocks, bool has_act_order) {
-    int best_g = -1;
-    float best_cost = 1e9f;
-
-    auto eval_cand = [&](int g) {
-        if (g < 1) return;
-        float cost = runtime_units(T, g, k_tiles, sms, bmax, group_blocks, thread_k_blocks, has_act_order);
-        if (cost < best_cost - 1e-5f) {
-            best_cost = cost;
-            best_g = g;
-        } else if (std::abs(cost - best_cost) <= 1e-5f && (best_g == -1 || g < best_g)) {
-            best_g = g;
-        }
-    };
-
-    for (int b = 1; b <= bmax; ++b) eval_cand(sms * b);
-    eval_cand(T);
-    eval_cand(std::max(sms, T));
-    for (int waves = 1; waves <= 4 * bmax; ++waves) {
-        int g = (T + waves - 1) / waves;
-        if (g >= sms && g <= sms * bmax) eval_cand(g);
-    }
-
-    return best_g;
-}
-
-} // namespace
-
 #define STATIC_ASSERT_SCALAR_TYPE_VALID(scalar_t)               \
   static_assert(std::is_same<scalar_t, half>::value ||          \
                     std::is_same<scalar_t, nv_bfloat16>::value, \
@@ -424,7 +353,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                bool has_act_order, bool is_k_full, bool has_zp, int num_groups,
                int group_size, int dev, cudaStream_t stream, int thread_k,
                int thread_n, int sms, int blocks_per_sm, bool use_atomic_add,
-               bool use_fp32_reduce, bool is_zp_float, int parallel_moe_blocks, bool use_tma) {
+               bool use_fp32_reduce, bool is_zp_float, bool use_tma) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
   bool is_a_8bit = a_type.size_bits() == 8;
@@ -728,23 +657,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
   int blocks = sms * exec_cfg.blocks_per_sm;
+  if (exec_cfg.blocks_per_sm > 1)
+    max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
 
   int thread_k_blocks = thread_k / 16;
   int thread_n_blocks = thread_n / 16;
-
-  int sel_n_tiles = prob_n / thread_n;
-  int sel_k_tiles = prob_k / thread_k;
-  int sel_mn_tiles = parallel_moe_blocks * sel_n_tiles;
-
-  // Dynamically search for the optimal grid size using the cost model
-  int blocks = best_grid(sel_mn_tiles, sel_k_tiles, sms, exec_cfg.blocks_per_sm, group_blocks, thread_k_blocks, has_act_order);
-
-  // Size the shared-memory budget to the CTAs that actually co-reside per SM,
-  // not the theoretical occupancy ceiling. When the chosen grid runs fewer
-  // blocks per SM this frees shared memory back to the pipeline.
-  int eff_blocks_per_sm = std::max(div_ceil(blocks, sms), 1);
-  if (eff_blocks_per_sm > 1)
-    max_shared_mem = max_shared_mem / eff_blocks_per_sm - 1024;
 
   TORCH_CHECK(is_valid_config(thread_tfg, m_block_size_8, thread_m_blocks,
                               prob_m, prob_n, prob_k, num_bits, group_size,
@@ -1126,7 +1043,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       b_type, c_type, s_type, has_bias, has_act_order, is_k_full, has_zp,
       num_groups, group_size, dev, at::cuda::getCurrentCUDAStream(dev),
       thread_k, thread_n, sms, blocks_per_sm, use_atomic_add, use_fp32_reduce,
-      is_zp_float, parallel_moe_blocks, use_tma);
+      is_zp_float, use_tma);
 
   return c;
 }
