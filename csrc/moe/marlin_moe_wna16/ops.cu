@@ -27,6 +27,7 @@
 
 #include "kernel.h"
 #include "marlin_sm90_tma_wgmma.cuh"
+#include "marlin_moe_cutlass69.h"
 #include "quantization/marlin/marlin_streamk_schedule.h"
 #include "core/registration.h"
 
@@ -515,6 +516,20 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                          dev);
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
+
+  if (marlin_moe_cutlass69_host::cutlass69_env_enabled()) {
+    auto cutlass69 = marlin_moe_cutlass69_host::select_host_path(
+        major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
+        prob_n, prob_k, has_act_order, has_zp, moe_block_size, group_size);
+    TORCH_CHECK(cutlass69.supported,
+                "CUTLASS example-69 path is not available: ", cutlass69.reason);
+    marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69(
+        A, B, C, b_s, sorted_token_ids, expert_ids, num_tokens_past_padded,
+        topk_weights, moe_block_size, num_experts, top_k, mul_topk_weights,
+        prob_m, prob_n, prob_k, a_type, b_type, c_type, group_size, dev,
+        stream);
+    return;
+  }
 
   const char* use_tma_wgmma_env = std::getenv("MARLIN_MOE_USE_TMA_WGMMA");
   if (use_tma_wgmma_env != nullptr && use_tma_wgmma_env[0] == '1') {

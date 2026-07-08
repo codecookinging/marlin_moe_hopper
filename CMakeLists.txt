@@ -169,6 +169,33 @@ marlin_configure_cuda_sources(
   WITH_STATIC_TEMPLATE_STUB_WORKAROUND)
 list(APPEND MARLIN_V100_MOE_SRC "${MARLIN_MOE_OTHER_SRC}")
 
+# Optional CUTLASS (example-69 grouped mixed-dtype GEMM experimental path).
+if (DEFINED ENV{CUTLASS_DIR})
+  set(MARLIN_CUTLASS_DIR "$ENV{CUTLASS_DIR}")
+elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include/cutlass/cutlass.h")
+  set(MARLIN_CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass")
+endif()
+
+set(MARLIN_MOE_CUTLASS69_SRC
+  "csrc/moe/marlin_moe_wna16/marlin_moe_cutlass69.cu")
+marlin_configure_cuda_sources(
+  SRCS "${MARLIN_MOE_CUTLASS69_SRC}"
+  CUDA_ARCHS "${CUDA_ARCHS}"
+  WITH_STATIC_TEMPLATE_STUB_WORKAROUND)
+list(APPEND MARLIN_V100_MOE_SRC "${MARLIN_MOE_CUTLASS69_SRC}")
+
+set(MOE_CUTLASS_INCLUDE_DIRS "")
+set(MOE_CUTLASS_COMPILE_FLAGS "")
+if (MARLIN_CUTLASS_DIR)
+  message(STATUS "marlin_v100 CUTLASS_DIR: ${MARLIN_CUTLASS_DIR}")
+  list(APPEND MOE_CUTLASS_INCLUDE_DIRS
+    "${MARLIN_CUTLASS_DIR}/include"
+    "${MARLIN_CUTLASS_DIR}/tools/util/include")
+  list(APPEND MOE_CUTLASS_COMPILE_FLAGS "-DMARLIN_MOE_HAS_CUTLASS")
+else()
+  message(STATUS "marlin_v100 CUTLASS_DIR not set; CUTLASS69 path will stub out at runtime")
+endif()
+
 define_extension_target(
   _C
   DESTINATION marlin_v100
@@ -184,7 +211,8 @@ define_extension_target(
   DESTINATION marlin_v100
   LANGUAGE ${VLLM_GPU_LANG}
   SOURCES ${MARLIN_V100_MOE_SRC}
-  COMPILE_FLAGS ${VLLM_GPU_FLAGS}
+  COMPILE_FLAGS ${VLLM_GPU_FLAGS} ${MOE_CUTLASS_COMPILE_FLAGS}
+  INCLUDE_DIRECTORIES ${MOE_CUTLASS_INCLUDE_DIRS}
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   USE_SABI 3
   WITH_SOABI)
