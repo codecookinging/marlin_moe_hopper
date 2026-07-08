@@ -111,7 +111,7 @@ setup(
     package_dir={"": "python"},
     packages=find_packages(where="python"),
     ext_modules=[
-        CMakeExtension("marlin_v100._C"),
+        # CMakeExtension("marlin_v100._C"),
         CMakeExtension("marlin_v100._moe_C"),
     ],
     cmdclass={"build_ext": CMakeBuild},
