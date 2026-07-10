@@ -24,6 +24,8 @@ endif()
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 find_package(Torch REQUIRED)
 
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/.venv/lib/python3.12/site-packages/nvidia/cu13/include")
+
 if (NOT HIP_FOUND)
   set(VLLM_GPU_LANG "CUDA")
 else()
@@ -190,7 +192,8 @@ if (MARLIN_CUTLASS_DIR)
   message(STATUS "marlin_v100 CUTLASS_DIR: ${MARLIN_CUTLASS_DIR}")
   list(APPEND MOE_CUTLASS_INCLUDE_DIRS
     "${MARLIN_CUTLASS_DIR}/include"
-    "${MARLIN_CUTLASS_DIR}/tools/util/include")
+    "${MARLIN_CUTLASS_DIR}/tools/util/include"
+    "${MARLIN_CUTLASS_DIR}/examples/113_hopper_gemm_activation_fusion")
   list(APPEND MOE_CUTLASS_COMPILE_FLAGS "-DMARLIN_MOE_HAS_CUTLASS")
 else()
   message(STATUS "marlin_v100 CUTLASS_DIR not set; CUTLASS69 path will stub out at runtime")

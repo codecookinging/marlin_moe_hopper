@@ -453,10 +453,10 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     TORCH_CHECK(cutlass69.supported,
                 "CUTLASS example-69 path is not available: ", cutlass69.reason);
     marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69(
-        A, B, C, b_s, sorted_token_ids, expert_ids, num_tokens_past_padded,
-        topk_weights, moe_block_size, num_experts, top_k, mul_topk_weights,
-        prob_m, prob_n, prob_k, a_type, b_type, c_type, group_size, dev,
-        stream);
+        A, B, C, b_s, sorted_token_ids_ptr, expert_ids_ptr,
+        num_tokens_past_padded_ptr, topk_weights_ptr, moe_block_size,
+        num_experts, top_k, mul_topk_weights, prob_m, prob_n, prob_k, a_type,
+        b_type, c_type, group_size, dev, stream);
     return;
   }
 
