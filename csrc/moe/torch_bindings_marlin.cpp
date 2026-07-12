@@ -52,6 +52,9 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "routed_scaling_factor, Tensor bias, int scoring_func) -> (Tensor, "
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
+
+  m.def("cutlass69_pack_and_reorder(Tensor q_weight_int8) -> Tensor");
+  m.impl("cutlass69_pack_and_reorder", torch::kCUDA, &cutlass69_pack_and_reorder);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

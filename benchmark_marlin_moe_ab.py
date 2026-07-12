@@ -487,7 +487,9 @@ def _case_weight(case: dict[str, Any]) -> float:
 
 def _build_case_tensors(case: MarlinMoECase, seed: int) -> dict[str, Any]:
     _lazy_imports()
-    from marlin_v100 import moe, routing
+    import os
+
+    from marlin_v100 import cutlass69, moe, routing
     from tests.helpers import marlin_quantize_experts, scalar_types
 
     _set_random_seed(seed)
@@ -499,9 +501,16 @@ def _build_case_tensors(case: MarlinMoECase, seed: int) -> dict[str, Any]:
     w2 = torch.randn((case.e, case.n, case.k), device=device, dtype=dtype) / 10
     scores = torch.randn((case.m, case.e), device=device, dtype=dtype)
 
-    w1_qweight, w1_scales, _w1_dequant = marlin_quantize_experts(
-        w1, scalar_types.uint4b8, case.group_size, act_order=False
+    use_cutlass69 = (
+        os.getenv("MARLIN_MOE_USE_CUTLASS69") == "1"
+        or os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1"
     )
+    if use_cutlass69 and case.k == 6144 and 2 * case.n in (256, 512):
+        w1_qweight, w1_scales = cutlass69.quantize_experts(w1, case.group_size)
+    else:
+        w1_qweight, w1_scales, _w1_dequant = marlin_quantize_experts(
+            w1, scalar_types.uint4b8, case.group_size, act_order=False
+        )
     w2_qweight, w2_scales, _w2_dequant = marlin_quantize_experts(
         w2, scalar_types.uint4b8, case.group_size, act_order=False
     )

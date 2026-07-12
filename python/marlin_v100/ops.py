@@ -70,3 +70,8 @@ def batched_moe_align_block_size(*args, **kwargs) -> None:
 def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     _load_moe()
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)
+
+
+def cutlass69_pack_and_reorder(q_weight_int8: torch.Tensor) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_pack_and_reorder(q_weight_int8)

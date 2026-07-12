@@ -179,7 +179,8 @@ elseif (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include/cutlass/
 endif()
 
 set(MARLIN_MOE_CUTLASS69_SRC
-  "csrc/moe/marlin_moe_wna16/marlin_moe_cutlass69.cu")
+  "csrc/moe/marlin_moe_wna16/marlin_moe_cutlass69.cu"
+  "csrc/moe/marlin_moe_cutlass69_repack.cu")
 marlin_configure_cuda_sources(
   SRCS "${MARLIN_MOE_CUTLASS69_SRC}"
   CUDA_ARCHS "${CUDA_ARCHS}"

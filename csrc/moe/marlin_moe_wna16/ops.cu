@@ -446,18 +446,32 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
 
+  if (marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled()) {
+    auto cutlass69 = marlin_moe_cutlass69_host::select_host_path(
+        major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
+        prob_n, prob_k, has_act_order, has_zp, moe_block_size, group_size);
+    if (cutlass69.supported) {
+      marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69_fused_gemm1(
+          A, B, C, b_s, sorted_token_ids_ptr, expert_ids_ptr,
+          num_tokens_past_padded_ptr, moe_block_size,
+          num_experts, top_k, prob_m, prob_n, prob_k, a_type,
+          b_type, c_type, group_size, dev, stream);
+      return;
+    }
+  }
+
   if (marlin_moe_cutlass69_host::cutlass69_env_enabled()) {
     auto cutlass69 = marlin_moe_cutlass69_host::select_host_path(
         major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
         prob_n, prob_k, has_act_order, has_zp, moe_block_size, group_size);
-    TORCH_CHECK(cutlass69.supported,
-                "CUTLASS example-69 path is not available: ", cutlass69.reason);
-    marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69(
-        A, B, C, b_s, sorted_token_ids_ptr, expert_ids_ptr,
-        num_tokens_past_padded_ptr, topk_weights_ptr, moe_block_size,
-        num_experts, top_k, mul_topk_weights, prob_m, prob_n, prob_k, a_type,
-        b_type, c_type, group_size, dev, stream);
-    return;
+    if (cutlass69.supported) {
+      marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69(
+          A, B, C, b_s, sorted_token_ids_ptr, expert_ids_ptr,
+          num_tokens_past_padded_ptr, topk_weights_ptr, moe_block_size,
+          num_experts, top_k, mul_topk_weights, prob_m, prob_n, prob_k, a_type,
+          b_type, c_type, group_size, dev, stream);
+      return;
+    }
   }
 
   const char* use_tma_wgmma_env = std::getenv("MARLIN_MOE_USE_TMA_WGMMA");
@@ -804,7 +818,40 @@ torch::Tensor moe_wna16_marlin_gemm(
   TORCH_CHECK(a.size(1) == size_k, "Shape mismatch: a.size(1) = ", a.size(1),
               ", size_k = ", size_k);
 
+  const bool cutlass69_requested =
+      marlin_moe_cutlass69_host::cutlass69_env_enabled() ||
+      marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled();
+  const bool cutlass69_fused_requested =
+      marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled();
+  const bool cutlass69_shapes =
+      size_k == 6144 && size_m >= 16 && size_m <= 8192 &&
+      (size_n == 256 || size_n == 512);
+  const bool use_cutlass69 = cutlass69_requested && cutlass69_shapes;
+  const bool use_cutlass69_fused = cutlass69_fused_requested && cutlass69_shapes;
+  const int64_t expected_c_n =
+      use_cutlass69_fused ? size_n / 2 : size_n;
+
   // Verify B
+  if (use_cutlass69) {
+    constexpr int kCutlassScaleChunk = 128;
+    const int scale_k =
+        (size_k + kCutlassScaleChunk - 1) / kCutlassScaleChunk;
+    TORCH_CHECK(b_q_weight.dtype() == torch::kUInt8,
+                "CUTLASS69 expects uint8 packed B weights");
+    TORCH_CHECK(b_q_weight.size(0) == num_experts,
+                "CUTLASS69 B experts mismatch");
+    TORCH_CHECK(b_q_weight.size(1) == size_n,
+                "CUTLASS69 B N mismatch");
+    TORCH_CHECK(b_q_weight.size(2) * 2 == size_k,
+                "CUTLASS69 packed B K mismatch");
+    TORCH_CHECK(b_scales.dim() == 3, "CUTLASS69 scales must be rank 3");
+    TORCH_CHECK(b_scales.size(0) == num_experts,
+                "CUTLASS69 scale experts mismatch");
+    TORCH_CHECK(b_scales.size(1) == size_n,
+                "CUTLASS69 scale N mismatch");
+    TORCH_CHECK(b_scales.size(2) == scale_k,
+                "CUTLASS69 scale K mismatch");
+  } else {
   TORCH_CHECK(
       size_k % MARLIN_NAMESPACE_NAME::tile_size == 0, "size_k = ", size_k,
       " is not divisible by tile_size = ", MARLIN_NAMESPACE_NAME::tile_size);
@@ -820,6 +867,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       (b_q_weight.size(2) / MARLIN_NAMESPACE_NAME::tile_size) * pack_factor;
   TORCH_CHECK(size_n == actual_size_n, "size_n = ", size_n,
               ", actual_size_n = ", actual_size_n);
+  }
 
   // Verify device and strides
   TORCH_CHECK(a.device().is_cuda(), "A is not on GPU");
@@ -860,10 +908,11 @@ torch::Tensor moe_wna16_marlin_gemm(
     TORCH_CHECK(c.size(0) == size_m * top_k,
                 "Shape mismatch: c.size(0) = ", c.size(0),
                 ", size_m * topk = ", size_m * top_k);
-    TORCH_CHECK(c.size(1) == size_n, "Shape mismatch: c.size(1) = ", c.size(1),
-                ", size_n = ", size_n);
+    TORCH_CHECK(c.size(1) == expected_c_n,
+                "Shape mismatch: c.size(1) = ", c.size(1),
+                ", expected_c_n = ", expected_c_n);
   } else {
-    c = torch::empty({size_m * top_k, size_n}, options);
+    c = torch::empty({size_m * top_k, expected_c_n}, options);
   }
 
   // Alloc C tmp buffer that is going to be used for the global reduce
@@ -883,14 +932,24 @@ torch::Tensor moe_wna16_marlin_gemm(
   int num_groups = -1;
   int group_size = -1;
 
-  int rank = b_scales.sizes().size();
-  TORCH_CHECK(rank == 3, "b_scales rank = ", rank, " is not 3");
-  TORCH_CHECK(b_scales.size(2) == size_n, "b_scales dim 2 = ", b_scales.size(2),
-              " is not size_n = ", size_n);
-  num_groups = b_scales.size(1);
+  if (use_cutlass69) {
+    constexpr int kCutlassScaleChunk = 128;
+    num_groups = (size_k + kCutlassScaleChunk - 1) / kCutlassScaleChunk;
+    group_size = kCutlassScaleChunk;
+  } else {
+    int rank = b_scales.sizes().size();
+    TORCH_CHECK(rank == 3, "b_scales rank = ", rank, " is not 3");
+    TORCH_CHECK(b_scales.size(2) == size_n, "b_scales dim 2 = ", b_scales.size(2),
+                " is not size_n = ", size_n);
+    num_groups = b_scales.size(1);
+  }
 
   torch::Tensor g_idx, perm, a_tmp;
-  if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
+  if (use_cutlass69) {
+    g_idx = torch::empty({0}, options);
+    perm = torch::empty({0}, options);
+    a_tmp = torch::empty({0}, options);
+  } else if (g_idx_or_none.has_value() && perm_or_none.has_value()) {
     g_idx = g_idx_or_none.value();
     perm = perm_or_none.value();
 
@@ -912,7 +971,7 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
   bool has_act_order = g_idx.size(-1) > 0 && perm.size(-1) > 0;
 
-  if (has_act_order) {
+  if (!use_cutlass69 && has_act_order) {
     a_tmp = torch::empty({size_m * top_k, size_k}, options);
     if (is_k_full) {
       TORCH_CHECK(num_groups > 1, "For act_order, num_groups must be > 1");
@@ -923,7 +982,7 @@ torch::Tensor moe_wna16_marlin_gemm(
       group_size = 0;
     }
 
-  } else {
+  } else if (!use_cutlass69) {
     a_tmp = torch::empty({0}, options);
     if (num_groups > 1) {
       TORCH_CHECK(
@@ -1009,16 +1068,18 @@ torch::Tensor moe_wna16_marlin_gemm(
   }
 
   // Verify workspace size
-  TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
-              "size_n = ", size_n, ", is not divisible by min_thread_n = ",
-              MARLIN_NAMESPACE_NAME::min_thread_n);
+  if (!use_cutlass69) {
+    TORCH_CHECK(size_n % MARLIN_NAMESPACE_NAME::min_thread_n == 0,
+                "size_n = ", size_n, ", is not divisible by min_thread_n = ",
+                MARLIN_NAMESPACE_NAME::min_thread_n);
 
-  int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
-  int min_workspace_size = min(
-      max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
-  TORCH_CHECK(workspace.numel() >= min_workspace_size,
-              "workspace.numel = ", workspace.numel(),
-              " is below min_workspace_size = ", min_workspace_size);
+    int max_n_tiles = size_n / MARLIN_NAMESPACE_NAME::min_thread_n;
+    int min_workspace_size = min(
+        max_n_tiles * (int)(sorted_token_ids.size(0) / moe_block_size), sms * 4);
+    TORCH_CHECK(workspace.numel() >= min_workspace_size,
+                "workspace.numel = ", workspace.numel(),
+                " is below min_workspace_size = ", min_workspace_size);
+  }
 
   int dev = a.get_device();
 
