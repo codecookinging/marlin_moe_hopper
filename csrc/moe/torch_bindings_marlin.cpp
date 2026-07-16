@@ -53,8 +53,40 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor)");
   m.impl("grouped_topk", torch::kCUDA, &grouped_topk);
 
+  m.def("cutlass69_pack_only(Tensor q_weight_int8) -> Tensor");
+  m.impl("cutlass69_pack_only", torch::kCUDA, &cutlass69_pack_only);
+
+  m.def("cutlass69_pack_only(Tensor q_weight_int8) -> Tensor");
+  m.impl("cutlass69_pack_only", torch::kCUDA, &cutlass69_pack_only);
+
   m.def("cutlass69_pack_and_reorder(Tensor q_weight_int8) -> Tensor");
   m.impl("cutlass69_pack_and_reorder", torch::kCUDA, &cutlass69_pack_and_reorder);
+
+  m.def(
+      "cutlass69_dequant_packed(Tensor packed, Tensor scales, int group_size) -> "
+      "Tensor");
+  m.impl("cutlass69_dequant_packed", torch::kCUDA, &cutlass69_dequant_packed);
+
+  m.def(
+      "cutlass69_dequant_reordered(Tensor reordered, Tensor scales, int "
+      "group_size) -> Tensor");
+  m.impl("cutlass69_dequant_reordered", torch::kCUDA, &cutlass69_dequant_reordered);
+
+  m.def(
+      "cutlass69_dequant_packed(Tensor packed, Tensor scales, int group_size) "
+      "-> Tensor");
+  m.impl("cutlass69_dequant_packed", torch::kCUDA, &cutlass69_dequant_packed);
+
+  m.def("moe_sum(Tensor input, Tensor! output) -> ()");
+  m.impl("moe_sum", torch::kCUDA, &moe_sum);
+
+  m.def(
+      "moe_cutlass69_fused_moe(Tensor hidden, Tensor w1, Tensor w1_scales, "
+      "Tensor w2, Tensor w2_scales, Tensor topk_weights, Tensor sorted_token_ids, "
+      "Tensor expert_ids, Tensor num_tokens_past_padded, int moe_block_size, "
+      "int top_k, int prob_m, int prob_n1, int prob_k1, int prob_n2, int prob_k2, "
+      "int group_size) -> Tensor");
+  m.impl("moe_cutlass69_fused_moe", torch::kCUDA, &moe_cutlass69_fused_moe);
 }
 
 REGISTER_EXTENSION(TORCH_EXTENSION_NAME)

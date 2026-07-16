@@ -446,6 +446,25 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
               "marlin kernel only support Turing or newer GPUs.");
 
+  if (marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled() ||
+      marlin_moe_cutlass69_host::cutlass69_env_enabled()) {
+    const char* gemm2_env = std::getenv("MARLIN_MOE_CUTLASS69_GEMM2");
+    const bool gemm2_enabled = gemm2_env != nullptr && gemm2_env[0] == '1';
+    if (gemm2_enabled) {
+      auto gemm2 = marlin_moe_cutlass69_host::select_gemm2_host_path(
+          major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
+          prob_n, prob_k, has_act_order, has_zp, moe_block_size, group_size);
+      if (gemm2.supported) {
+        marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69_gemm2(
+            A, B, C, b_s, sorted_token_ids_ptr, expert_ids_ptr,
+            num_tokens_past_padded_ptr, topk_weights_ptr, moe_block_size,
+            num_experts, top_k, mul_topk_weights, prob_m, prob_n, prob_k,
+            a_type, b_type, c_type, group_size, dev, stream);
+        return;
+      }
+    }
+  }
+
   if (marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled()) {
     auto cutlass69 = marlin_moe_cutlass69_host::select_host_path(
         major_capability, a_type.size_bits(), b_type.size_bits(), prob_m,
@@ -823,11 +842,25 @@ torch::Tensor moe_wna16_marlin_gemm(
       marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled();
   const bool cutlass69_fused_requested =
       marlin_moe_cutlass69_host::cutlass69_fused_gemm1_env_enabled();
-  const bool cutlass69_shapes =
+  const bool cutlass69_gemm1_shapes =
       size_k == 6144 && size_m >= 16 && size_m <= 8192 &&
       (size_n == 256 || size_n == 512);
-  const bool use_cutlass69 = cutlass69_requested && cutlass69_shapes;
-  const bool use_cutlass69_fused = cutlass69_fused_requested && cutlass69_shapes;
+  const bool cutlass69_gemm2_shapes =
+      size_k == 256 && size_m >= 16 && size_m <= 65536 && size_n == 6144;
+  const char* gemm2_env = std::getenv("MARLIN_MOE_CUTLASS69_GEMM2");
+  const bool cutlass69_gemm2_enabled =
+      gemm2_env != nullptr && gemm2_env[0] == '1';
+  const bool b_is_cutlass69_packed =
+      b_q_weight.dtype() == torch::kUInt8 && b_q_weight.dim() == 3 &&
+      b_q_weight.size(1) == size_n && b_q_weight.size(2) * 2 == size_k;
+  const bool use_cutlass69_gemm1 =
+      cutlass69_requested && cutlass69_gemm1_shapes && b_is_cutlass69_packed;
+  const bool use_cutlass69_gemm2 =
+      cutlass69_requested && cutlass69_gemm2_shapes &&
+      cutlass69_gemm2_enabled && b_is_cutlass69_packed;
+  const bool use_cutlass69 = use_cutlass69_gemm1 || use_cutlass69_gemm2;
+  const bool use_cutlass69_fused =
+      cutlass69_fused_requested && cutlass69_gemm1_shapes;
   const int64_t expected_c_n =
       use_cutlass69_fused ? size_n / 2 : size_n;
 
@@ -1107,6 +1140,40 @@ torch::Tensor moe_wna16_marlin_gemm(
       is_zp_float, use_tma);
 
   return c;
+}
+
+torch::Tensor moe_cutlass69_fused_moe(
+    torch::Tensor hidden, torch::Tensor w1, torch::Tensor w1_scales,
+    torch::Tensor w2, torch::Tensor w2_scales, torch::Tensor topk_weights,
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_past_padded, int64_t moe_block_size, int64_t top_k,
+    int64_t prob_m, int64_t prob_n1, int64_t prob_k1, int64_t prob_n2,
+    int64_t prob_k2, int64_t group_size) {
+  TORCH_CHECK(hidden.is_cuda(), "hidden must be on CUDA");
+  TORCH_CHECK(w1.dtype() == torch::kUInt8, "w1 must be CUTLASS69 uint8");
+  TORCH_CHECK(w2.dtype() == torch::kUInt8, "w2 must be CUTLASS69 uint8");
+  const int num_experts = static_cast<int>(w1.size(0));
+  auto options = torch::TensorOptions().dtype(hidden.dtype()).device(hidden.device());
+  torch::Tensor output = torch::empty({prob_m, prob_n2}, options);
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(hidden));
+  const int dev = hidden.get_device();
+  vllm::ScalarType c_type = hidden.scalar_type() == at::ScalarType::Half
+                                ? vllm::kFloat16
+                                : vllm::kBFloat16;
+
+  marlin_moe_cutlass69_host::dispatch_marlin_moe_cutlass69_fused_moe_full(
+      hidden.data_ptr(), w1.data_ptr(), w2.data_ptr(), output.data_ptr(),
+      w1_scales.data_ptr(), w2_scales.data_ptr(),
+      topk_weights.contiguous().data_ptr<float>(),
+      sorted_token_ids.data_ptr<int32_t>(), expert_ids.data_ptr<int32_t>(),
+      num_tokens_past_padded.data_ptr<int32_t>(),
+      static_cast<int>(moe_block_size), num_experts, static_cast<int>(top_k),
+      static_cast<int>(prob_m), static_cast<int>(prob_n1),
+      static_cast<int>(prob_k1), static_cast<int>(prob_n2),
+      static_cast<int>(prob_k2), c_type,
+      static_cast<int>(group_size), dev, at::cuda::getCurrentCUDAStream(dev));
+  return output;
 }
 
 TORCH_LIBRARY_IMPL_EXPAND(TORCH_EXTENSION_NAME, CUDA, m) {

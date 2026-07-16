@@ -72,6 +72,49 @@ def moe_wna16_marlin_gemm(*args, **kwargs) -> torch.Tensor:
     return torch.ops._moe_C.moe_wna16_marlin_gemm(*args, **kwargs)
 
 
+def cutlass69_pack_only(q_weight_int8: torch.Tensor) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_pack_only(q_weight_int8)
+
+
+def cutlass69_pack_only(q_weight_int8: torch.Tensor) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_pack_only(q_weight_int8)
+
+
 def cutlass69_pack_and_reorder(q_weight_int8: torch.Tensor) -> torch.Tensor:
     _load_moe()
     return torch.ops._moe_C.cutlass69_pack_and_reorder(q_weight_int8)
+
+
+def cutlass69_dequant_packed(
+    packed: torch.Tensor, scales: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_dequant_packed(packed, scales, group_size)
+
+
+def cutlass69_dequant_reordered(
+    reordered: torch.Tensor, scales: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_dequant_reordered(
+        reordered, scales, group_size
+    )
+
+
+def cutlass69_dequant_packed(
+    packed: torch.Tensor, scales: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.cutlass69_dequant_packed(packed, scales, group_size)
+
+
+def moe_sum(input: torch.Tensor, output: torch.Tensor) -> None:
+    _load_moe()
+    torch.ops._moe_C.moe_sum(input, output)
+
+
+def moe_cutlass69_fused_moe(*args, **kwargs) -> torch.Tensor:
+    _load_moe()
+    return torch.ops._moe_C.moe_cutlass69_fused_moe(*args, **kwargs)

@@ -24,7 +24,7 @@ endif()
 append_cmake_prefix_path("torch" "torch.utils.cmake_prefix_path")
 find_package(Torch REQUIRED)
 
-include_directories("${CMAKE_CURRENT_SOURCE_DIR}/.venv/lib/python3.12/site-packages/nvidia/cu13/include")
+include_directories("${CMAKE_CURRENT_SOURCE_DIR}/third_party/cuda_compat/include")
 
 if (NOT HIP_FOUND)
   set(VLLM_GPU_LANG "CUDA")

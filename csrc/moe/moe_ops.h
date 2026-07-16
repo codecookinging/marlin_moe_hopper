@@ -71,5 +71,26 @@ torch::Tensor router_gemm_bf16_fp32(torch::Tensor const& input,
 void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a,
                       const torch::Tensor& mat_b);
 
+torch::Tensor cutlass69_pack_only(torch::Tensor q_weight_int8);
+torch::Tensor cutlass69_reorder_packed(torch::Tensor packed);
+torch::Tensor cutlass69_dequant_packed(torch::Tensor packed, torch::Tensor scales,
+                                       int64_t group_size);
+torch::Tensor cutlass69_pack_only(torch::Tensor q_weight_int8);
+torch::Tensor cutlass69_pack_only(torch::Tensor q_weight_int8);
 torch::Tensor cutlass69_pack_and_reorder(torch::Tensor q_weight_int8);
+torch::Tensor cutlass69_dequant_packed(torch::Tensor packed, torch::Tensor scales,
+                                       int64_t group_size);
+torch::Tensor cutlass69_dequant_reordered(torch::Tensor reordered,
+                                          torch::Tensor scales,
+                                          int64_t group_size);
+torch::Tensor cutlass69_dequant_packed(torch::Tensor packed,
+                                       torch::Tensor scales,
+                                       int64_t group_size);
+torch::Tensor moe_cutlass69_fused_moe(
+    torch::Tensor hidden, torch::Tensor w1, torch::Tensor w1_scales,
+    torch::Tensor w2, torch::Tensor w2_scales, torch::Tensor topk_weights,
+    torch::Tensor sorted_token_ids, torch::Tensor expert_ids,
+    torch::Tensor num_tokens_past_padded, int64_t moe_block_size, int64_t top_k,
+    int64_t prob_m, int64_t prob_n1, int64_t prob_k1, int64_t prob_n2,
+    int64_t prob_k2, int64_t group_size);
 #endif

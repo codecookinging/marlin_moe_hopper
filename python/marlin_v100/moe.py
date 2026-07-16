@@ -160,6 +160,7 @@ def fused_marlin_moe(
 
     profile = _cutlass69_profile_enabled()
     timer = _MoeStageTimer() if profile else None
+    global _moe_profile_call_id
 
     sorted_ids, expert_ids, num_tokens_post_pad = moe_align_block_size(
         topk_ids, moe_block_size, w1.shape[0]
@@ -209,12 +210,61 @@ def fused_marlin_moe(
         os.getenv("MARLIN_MOE_USE_CUTLASS69") == "1"
         or os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1"
     ) and k == 6144 and 16 <= m <= 8192 and intermediate_size in (256, 512)
+    use_cutlass69_gemm2 = (
+        os.getenv("MARLIN_MOE_CUTLASS69_GEMM2") == "1"
+        and (
+            os.getenv("MARLIN_MOE_USE_CUTLASS69") == "1"
+            or os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1"
+        )
+        and n == 256
+        and output_size == 6144
+        and 16 <= m * topk <= 65536
+    )
     if use_cutlass69:
         w1, w1_scale = cutlass69.ensure_cutlass69_expert_weights(
             w1, w1_scale, k, intermediate_size
         )
+    if use_cutlass69_gemm2:
+        w2, w2_scale = cutlass69.ensure_cutlass69_expert_weights(
+            w2, w2_scale, n, output_size
+        )
     if timer is not None:
         timer.mark("cutlass69_bridge_w1")
+        if use_cutlass69_gemm2:
+            timer.mark("cutlass69_bridge_w2")
+
+    use_cutlass69_full = (
+        use_cutlass69_gemm2
+        and os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1"
+    )
+    if use_cutlass69_full:
+        result = ops.moe_cutlass69_fused_moe(
+            hidden_states,
+            w1,
+            w1_scale,
+            w2,
+            w2_scale,
+            topk_weights,
+            sorted_ids,
+            expert_ids,
+            num_tokens_post_pad,
+            moe_block_size,
+            topk,
+            m,
+            intermediate_size,
+            k,
+            output_size,
+            n,
+            128,
+        )
+        if timer is not None:
+            timer.mark("cutlass69_fused_moe_full")
+            _moe_profile_call_id += 1
+            timer.print_summary(
+                f"[MoE python profile #{_moe_profile_call_id}] "
+                f"M={m} K={k} N1={intermediate_size} N2={output_size} topk={topk}"
+            )
+        return result
 
     if os.getenv("MARLIN_MOE_USE_CUTLASS69_FUSED_GEMM1") == "1":
         activated = torch.empty(
@@ -334,11 +384,11 @@ def fused_marlin_moe(
         use_tma,
     )
     if timer is not None:
-        timer.mark("gemm2_marlin")
-    result = output.view(m, topk, output_size).sum(dim=1)
+        timer.mark("gemm2_marlin" if not use_cutlass69_gemm2 else "gemm2_cutlass69")
+    result = torch.empty((m, output_size), dtype=hidden_states.dtype, device=hidden_states.device)
+    ops.moe_sum(output.view(m, topk, output_size), result)
     if timer is not None:
         timer.mark("topk_reduce")
-        global _moe_profile_call_id
         _moe_profile_call_id += 1
         timer.print_summary(
             f"[MoE python profile #{_moe_profile_call_id}] "
