@@ -98,7 +98,7 @@ class ModelPreset:
     act_order: bool = False
     dtype: str = "bfloat16"
     decode_ms: tuple[int, ...] = (1, 2, 4, 8)
-    small_batch_ms: tuple[int, ...] = (16, 32, 64)
+    small_batch_ms: tuple[int, ...] = (16, 24, 32, 40, 48, 56)
     prefill_ms: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096, 8192)
 
 
@@ -306,7 +306,7 @@ def _glm5_core_cases(preset: ModelPreset) -> list[MarlinMoECase]:
 def _glm5_full_cases(preset: ModelPreset) -> list[MarlinMoECase]:
     """Broader sweep for kernel tuning on GLM-5."""
     cases = _glm5_core_cases(preset)
-    for m in (2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
+    for m in (2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 128, 256, 512, 1024, 2048, 4096, 8192):
         if any(c.m == m and c.k == preset.k for c in cases):
             continue
         cases.append(_make_glm5_case(preset, name=f"{preset.name}_sweep_m{m}", m=m))
