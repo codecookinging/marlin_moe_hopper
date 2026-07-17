@@ -187,6 +187,7 @@ def fused_marlin_moe(
             -1,
             -1,
             -1,
+            False,
         )
     else:
         if full_sorted_ids.numel() > 0:
@@ -194,14 +195,14 @@ def fused_marlin_moe(
                 hidden_states, intermediate, w1, bias1, w1_scale, None, global_scale1, w1_zeros, g_idx1, sort_indices1,
                 workspace, full_sorted_ids, full_expert_ids, full_num_tokens, topk_weights,
                 64, topk, False, quant_type_id, m, intermediate_size, k,
-                is_k_full, False, True, False, -1, -1, -1
+                is_k_full, False, True, False, -1, -1, -1, False
             )
         if partial_sorted_ids.numel() > 0:
             ops.moe_wna16_marlin_gemm(
                 hidden_states, intermediate, w1, bias1, w1_scale, None, global_scale1, w1_zeros, g_idx1, sort_indices1,
                 workspace, partial_sorted_ids, partial_expert_ids, partial_num_tokens, topk_weights,
                 16, topk, False, quant_type_id, m, intermediate_size, k,
-                is_k_full, False, True, False, -1, -1, -1
+                is_k_full, False, True, False, -1, -1, -1, False
             )
     gate, up = intermediate.view(m * topk, intermediate_size).chunk(2, dim=-1)
     activated = torch.nn.functional.silu(gate) * up
@@ -240,6 +241,7 @@ def fused_marlin_moe(
             -1,
             -1,
             -1,
+            False,
         )
     else:
         if full_sorted_ids.numel() > 0:
@@ -247,13 +249,13 @@ def fused_marlin_moe(
                 activated, output, w2, bias2, w2_scale, None, global_scale2, w2_zeros, g_idx2, sort_indices2,
                 workspace, full_sorted_ids, full_expert_ids, full_num_tokens, topk_weights,
                 64, 1, True, quant_type_id, m * topk, output_size, n,
-                is_k_full, False, True, False, -1, -1, -1
+                is_k_full, False, True, False, -1, -1, -1, False
             )
         if partial_sorted_ids.numel() > 0:
             ops.moe_wna16_marlin_gemm(
                 activated, output, w2, bias2, w2_scale, None, global_scale2, w2_zeros, g_idx2, sort_indices2,
                 workspace, partial_sorted_ids, partial_expert_ids, partial_num_tokens, topk_weights,
                 16, 1, True, quant_type_id, m * topk, output_size, n,
-                is_k_full, False, True, False, -1, -1, -1
+                is_k_full, False, True, False, -1, -1, -1, False
             )
     return output.view(m, topk, output_size).sum(dim=1)
